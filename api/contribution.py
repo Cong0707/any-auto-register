@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from core.config_store import config_store
 
-router = APIRouter(prefix="/contribution", tags=["contribution"])
+router = APIRouter(prefix="/public", tags=["contribution"])
 
 DEFAULT_CONTRIBUTION_SERVER_URL = "http://new.xem8k5.top:7317/"
 SERVER_STATS_CANDIDATES: list[tuple[str, str]] = [
