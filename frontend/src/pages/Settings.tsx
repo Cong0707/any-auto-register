@@ -1162,42 +1162,37 @@ function ContributionPanel({
       return
     }
 
-    Modal.confirm({
-      title: '确认提现吗？',
-      content: `将按 ${redeemAmount} 发起提现请求`,
-      okText: '确认提现',
-      cancelText: '取消',
-      onOk: async () => {
-        setRedeeming(true)
-        try {
-          const data = await apiFetch('/contribution/redeem', {
-            method: 'POST',
-            body: JSON.stringify({
-              server_url: contributionServerUrl,
-              key: contributionKey,
-              amount_usd: redeemAmount,
-            }),
-          })
-          const result = asRecord(data)
-          const payload = asRecord(result?.['data']) || result
-          const code = pickString(payload, ['code', 'redeem_code', 'voucher_code'])
-          const amount = pickNumber(payload, ['redeemed_amount_usd', 'redeemed_amount', 'amount_usd'])
-          setRedeemResponse(result)
-          if (amount !== null || code) {
-            message.success(`提现成功！额度：${amount !== null ? formatDisplayNumber(amount, 2) : '-'} 兑换码：${code || '-'}`)
-          } else {
-            message.success('提现成功')
-          }
-          await fetchStats(true)
-        } catch (e: any) {
-          const detail = String(e?.message || '提现失败')
-          setRedeemResponse({ ok: false, error: detail })
-          message.error(detail)
-        } finally {
-          setRedeeming(false)
-        }
-      },
-    })
+    const confirmed = window.confirm(`确认提现吗？\n将按 ${redeemAmount} 发起提现请求`)
+    if (!confirmed) return
+
+    setRedeeming(true)
+    try {
+      const data = await apiFetch('/contribution/redeem', {
+        method: 'POST',
+        body: JSON.stringify({
+          server_url: contributionServerUrl,
+          key: contributionKey,
+          amount_usd: redeemAmount,
+        }),
+      })
+      const result = asRecord(data)
+      const payload = asRecord(result?.['data']) || result
+      const code = pickString(payload, ['code', 'redeem_code', 'voucher_code'])
+      const amount = pickNumber(payload, ['redeemed_amount_usd', 'redeemed_amount', 'amount_usd'])
+      setRedeemResponse(result)
+      if (amount !== null || code) {
+        message.success(`提现成功！额度：${amount !== null ? formatDisplayNumber(amount, 2) : '-'} 兑换码：${code || '-'}`)
+      } else {
+        message.success('提现成功')
+      }
+      await fetchStats(true)
+    } catch (e: any) {
+      const detail = String(e?.message || '提现失败')
+      setRedeemResponse({ ok: false, error: detail })
+      message.error(detail)
+    } finally {
+      setRedeeming(false)
+    }
   }
 
   const doGenerateKey = async () => {
