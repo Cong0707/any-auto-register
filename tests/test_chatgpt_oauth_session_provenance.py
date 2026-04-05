@@ -106,6 +106,34 @@ class OAuthSessionProvenanceTests(unittest.TestCase):
         self.assertEqual(workspace_ids, {"ws-1"})
         self.assertEqual(org_ids, {"org-1"})
 
+    def test_decode_cookie_json_value_prefers_jwt_payload_over_header(self):
+        # header
+        seg1 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        # payload {"workspaces":[{"id":"ws-1"}],"session_id":"sess-1"}
+        seg2 = (
+            "eyJ3b3Jrc3BhY2VzIjpbeyJpZCI6IndzLTEifV0sInNlc3Npb25faWQiOiJzZXNzLTEifQ"
+        )
+        token = f"{seg1}.{seg2}.signature"
+
+        parsed = OAuthClient._decode_cookie_json_value(token)
+        self.assertTrue(parsed)
+        self.assertIn("workspaces", parsed)
+        self.assertEqual(parsed["workspaces"][0]["id"], "ws-1")
+
+    def test_load_workspace_session_data_returns_none_when_no_workspace(self):
+        cookie = {"alg": "HS256", "typ": "JWT"}  # 无 workspace
+
+        with mock.patch.object(self.client, "_decode_oauth_session_cookie", return_value=cookie), \
+            mock.patch.object(self.client, "_fetch_consent_page_html", return_value=""), \
+            mock.patch.object(self.client, "_extract_session_data_from_consent_html", return_value=None):
+            result = self.client._load_workspace_session_data(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "UA",
+                None,
+            )
+
+        self.assertIsNone(result)
+
 
 if __name__ == "__main__":
     unittest.main()
