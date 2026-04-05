@@ -2930,6 +2930,123 @@ class OAuthClient:
             self._log(f"session provenance 选择: {reason}")
             return selected
 
+        api_data = self._load_workspace_session_data_via_api(
+            consent_url=consent_url,
+            user_agent=user_agent,
+            impersonate=impersonate,
+            referer=consent_referer,
+        )
+        if api_data and api_data.get("workspaces"):
+            self._log(
+                f"session provenance API 兜底成功: workspaces={len(api_data.get('workspaces', []))}"
+            )
+            return api_data
+
+        return None
+
+    def _extract_session_data_from_workspace_api_payload(self, payload) -> dict | None:
+        data = payload if isinstance(payload, dict) else {}
+        if not data:
+            return None
+
+        def _as_dict(value):
+            return value if isinstance(value, dict) else {}
+
+        primary = data
+        nested = _as_dict(data.get("data"))
+        session_id = (
+            str(primary.get("session_id") or "").strip()
+            or str(nested.get("session_id") or "").strip()
+        )
+        client_id = (
+            str(primary.get("openai_client_id") or "").strip()
+            or str(nested.get("openai_client_id") or "").strip()
+        )
+
+        raw_workspaces = None
+        for candidate in (
+            primary.get("workspaces"),
+            nested.get("workspaces"),
+            primary.get("items"),
+            nested.get("items"),
+        ):
+            if isinstance(candidate, list):
+                raw_workspaces = candidate
+                break
+        if raw_workspaces is None and isinstance(primary.get("workspace"), dict):
+            raw_workspaces = [primary.get("workspace")]
+        if raw_workspaces is None and isinstance(nested.get("workspace"), dict):
+            raw_workspaces = [nested.get("workspace")]
+
+        if not isinstance(raw_workspaces, list):
+            return None
+
+        workspaces = []
+        for item in raw_workspaces:
+            if not isinstance(item, dict):
+                continue
+            wid = str(item.get("id") or "").strip()
+            if not wid:
+                continue
+            workspaces.append(dict(item))
+
+        if not workspaces:
+            return None
+
+        parsed = {
+            "session_id": session_id,
+            "openai_client_id": client_id,
+            "workspaces": workspaces,
+        }
+        return self._clean_session_data(parsed)
+
+    def _load_workspace_session_data_via_api(
+        self,
+        *,
+        consent_url: str,
+        user_agent,
+        impersonate,
+        referer: str | None = None,
+    ) -> dict | None:
+        referer_value = (
+            str(referer or "").strip()
+            or str(consent_url or "").strip()
+            or f"{self.oauth_issuer}/add-phone"
+        )
+        candidates = [
+            f"{self.oauth_issuer}/api/accounts/workspace/",
+            f"{self.oauth_issuer}/api/accounts/workspace",
+            f"{self.oauth_issuer}/api/accounts/session",
+        ]
+        for idx, api_url in enumerate(candidates, start=1):
+            try:
+                headers = self._headers(
+                    api_url,
+                    user_agent=user_agent,
+                    accept="application/json, text/plain, */*",
+                    referer=referer_value,
+                    fetch_site="same-origin",
+                )
+                headers.update(self._trace_headers("workspace_select_api_probe", idx))
+                kwargs = {"headers": headers, "allow_redirects": False, "timeout": 20}
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+                self._browser_pause(0.08, 0.2)
+                resp = self.session.get(api_url, **kwargs)
+                status = int(getattr(resp, "status_code", 0) or 0)
+                self._log(f"workspace api probe[{idx}] -> {status} {api_url}")
+                if status != 200:
+                    continue
+                try:
+                    payload = resp.json()
+                except Exception:
+                    continue
+                parsed = self._extract_session_data_from_workspace_api_payload(payload)
+                if parsed and parsed.get("workspaces"):
+                    return parsed
+            except Exception as e:
+                self._log(f"workspace api probe[{idx}] 异常: {e}")
+                continue
         return None
 
     def _fetch_consent_page_html(
