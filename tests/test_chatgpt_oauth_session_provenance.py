@@ -134,6 +134,82 @@ class OAuthSessionProvenanceTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_extract_session_data_from_workspace_api_payload_supports_nested_items(self):
+        payload = {
+            "data": {
+                "session_id": "sess-api",
+                "openai_client_id": "client-api",
+                "items": [
+                    _ws("ws-api-1", "org-api-1"),
+                    _ws("ws-api-2"),
+                ],
+            }
+        }
+        parsed = self.client._extract_session_data_from_workspace_api_payload(payload)
+        self.assertTrue(parsed)
+        self.assertEqual(parsed.get("session_id"), "sess-api")
+        self.assertEqual(parsed.get("openai_client_id"), "client-api")
+        workspace_ids, org_ids = self.client._extract_workspace_org_ids_from_session(parsed)
+        self.assertEqual(workspace_ids, {"ws-api-1", "ws-api-2"})
+        self.assertEqual(org_ids, {"org-api-1"})
+
+    def test_load_workspace_session_data_uses_api_fallback_when_cookie_html_missing(self):
+        api_data = {
+            "session_id": "sess-api",
+            "openai_client_id": "client-api",
+            "workspaces": [_ws("ws-api-1", "org-api-1")],
+        }
+        with mock.patch.object(self.client, "_decode_oauth_session_cookie", return_value={"alg": "HS256"}), \
+            mock.patch.object(self.client, "_fetch_consent_page_html", return_value=""), \
+            mock.patch.object(self.client, "_extract_session_data_from_consent_html", return_value=None), \
+            mock.patch.object(self.client, "_load_workspace_session_data_via_api", return_value=api_data) as load_api:
+            result = self.client._load_workspace_session_data(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "UA",
+                None,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(result.get("session_id"), "sess-api")
+        load_api.assert_called_once()
+
+    def test_load_workspace_session_data_via_api_probes_until_success(self):
+        class _Resp:
+            def __init__(self, status_code, payload=None, url="https://auth.openai.com/api/accounts/workspace/"):
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.url = url
+                self.headers = {"content-type": "application/json"}
+
+            def json(self):
+                return self._payload
+
+        responses = [
+            _Resp(404),
+            _Resp(
+                200,
+                payload={
+                    "data": {
+                        "session_id": "sess-api",
+                        "openai_client_id": "client-api",
+                        "workspaces": [_ws("ws-api-1", "org-api-1")],
+                    }
+                },
+            ),
+        ]
+
+        with mock.patch.object(self.client.session, "get", side_effect=responses) as mocked_get:
+            parsed = self.client._load_workspace_session_data_via_api(
+                consent_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                user_agent="UA",
+                impersonate=None,
+                referer="https://auth.openai.com/add-phone",
+            )
+
+        self.assertTrue(parsed)
+        self.assertEqual(parsed.get("session_id"), "sess-api")
+        self.assertEqual(mocked_get.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
