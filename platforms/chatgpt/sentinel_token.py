@@ -601,6 +601,24 @@ def build_sentinel_token(
             expected_device_id=device,
             source=source,
         )
+        if (not ok) and source == "browser" and reason == "device_mismatch" and token:
+            parsed = _parse_token(token)
+            adopted_device = str(parsed.get("id") or "").strip()
+            if adopted_device:
+                adopt_ok, adopt_score, adopt_reason = _evaluate_token_quality(
+                    token,
+                    expected_flow=flow_norm,
+                    expected_device_id=adopted_device,
+                    source=source,
+                )
+                if adopt_ok:
+                    logger(
+                        f"Sentinel browser did 自适应成功: expected={device}, adopted={adopted_device}"
+                    )
+                    device = adopted_device
+                    ok, score, reason = True, adopt_score, "device_adopted"
+                else:
+                    reason = f"device_mismatch:{adopt_reason}"
         _update_source_ewma(flow_norm, proxy, source, success=ok)
 
         if ok and token:

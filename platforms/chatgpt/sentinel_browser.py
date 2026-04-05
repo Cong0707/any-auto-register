@@ -63,6 +63,113 @@ def _apply_env_overrides(
     return flow, proxy, timeout_ms, target_url, user_agent
 
 
+def _extract_token_device_id(token: str) -> str:
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("id") or "").strip()
+
+
+def _seed_openai_device_cookie(context, device_id: str, logger: Callable[[str], None]) -> None:
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    cookie_payloads = [
+        {
+            "name": "oai-did",
+            "value": did,
+            "url": "https://auth.openai.com/",
+            "path": "/",
+            "secure": True,
+            "sameSite": "Lax",
+        },
+        {
+            "name": "oai-did",
+            "value": did,
+            "url": "https://sentinel.openai.com/",
+            "path": "/",
+            "secure": True,
+            "sameSite": "Lax",
+        },
+        {
+            "name": "oai-did",
+            "value": did,
+            "domain": ".openai.com",
+            "path": "/",
+            "secure": True,
+            "sameSite": "Lax",
+        },
+    ]
+    for cookie in cookie_payloads:
+        try:
+            context.add_cookies([cookie])
+        except Exception:
+            continue
+    logger(f"Sentinel Browser 预置 did cookie: {did}")
+
+
+def _prime_page_device_id(page, device_id: str, logger: Callable[[str], None]) -> None:
+    did = str(device_id or "").strip()
+    if not did:
+        return
+    try:
+        page.evaluate(
+            """
+            ({ did }) => {
+                const value = encodeURIComponent(did);
+                const directives = [
+                    "path=/",
+                    "domain=.openai.com",
+                    "secure",
+                    "samesite=lax",
+                ].join("; ");
+                document.cookie = `oai-did=${value}; ${directives}`;
+                try { localStorage.setItem("oai-did", did); } catch (_) {}
+                try { sessionStorage.setItem("oai-did", did); } catch (_) {}
+                return {
+                    cookie: document.cookie || "",
+                    ls: (() => { try { return localStorage.getItem("oai-did") || ""; } catch (_) { return ""; } })(),
+                    ss: (() => { try { return sessionStorage.getItem("oai-did") || ""; } catch (_) { return ""; } })(),
+                };
+            }
+            """,
+            {"did": did},
+        )
+        logger(f"Sentinel Browser 页面 did 已对齐: {did}")
+    except Exception as exc:
+        logger(f"Sentinel Browser 页面 did 注入失败: {exc}")
+
+
+def _request_sentinel_token(page, flow: str) -> dict:
+    return page.evaluate(
+        """
+        async ({ flow }) => {
+            try {
+                const token = await window.SentinelSDK.token(flow);
+                let tokenId = "";
+                try {
+                    const parsed = JSON.parse(token || "{}");
+                    tokenId = parsed && parsed.id ? String(parsed.id) : "";
+                } catch (_) {}
+                return { success: true, token, token_id: tokenId };
+            } catch (e) {
+                return {
+                    success: false,
+                    error: (e && (e.message || String(e))) || "unknown",
+                };
+            }
+        }
+        """,
+        {"flow": flow},
+    )
+
+
 def get_sentinel_token_via_browser(
     *,
     flow: str,
@@ -130,45 +237,18 @@ def get_sentinel_token_via_browser(
                 ignore_https_errors=True,
             )
             if device_id:
-                try:
-                    context.add_cookies(
-                        [
-                            {
-                                "name": "oai-did",
-                                "value": str(device_id),
-                                "url": "https://auth.openai.com/",
-                                "path": "/",
-                                "secure": True,
-                                "sameSite": "Lax",
-                            }
-                        ]
-                    )
-                except Exception:
-                    pass
+                _seed_openai_device_cookie(context, str(device_id or "").strip(), logger)
 
             page = context.new_page()
             page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if device_id:
+                _prime_page_device_id(page, str(device_id or "").strip(), logger)
             page.wait_for_function(
                 "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
                 timeout=min(timeout_ms, 15000),
             )
 
-            result = page.evaluate(
-                """
-                async ({ flow }) => {
-                    try {
-                        const token = await window.SentinelSDK.token(flow);
-                        return { success: true, token };
-                    } catch (e) {
-                        return {
-                            success: false,
-                            error: (e && (e.message || String(e))) || "unknown",
-                        };
-                    }
-                }
-                """,
-                {"flow": flow},
-            )
+            result = _request_sentinel_token(page, flow)
 
             if not result or not result.get("success") or not result.get("token"):
                 logger(
@@ -182,13 +262,36 @@ def get_sentinel_token_via_browser(
                 logger("Sentinel Browser 返回空 token")
                 return None
 
+            expected_did = str(device_id or "").strip()
+            token_did = _extract_token_device_id(token)
+            if expected_did and token_did and token_did != expected_did:
+                logger(
+                    f"Sentinel Browser did 不一致，重试对齐: expected={expected_did}, token={token_did}"
+                )
+                _seed_openai_device_cookie(context, expected_did, logger)
+                _prime_page_device_id(page, expected_did, logger)
+                retry_result = _request_sentinel_token(page, flow)
+                if retry_result and retry_result.get("success") and retry_result.get("token"):
+                    retry_token = str(retry_result.get("token") or "").strip()
+                    retry_did = _extract_token_device_id(retry_token)
+                    if retry_token:
+                        token = retry_token
+                        token_did = retry_did or token_did
+                        if retry_did == expected_did:
+                            logger("Sentinel Browser did 对齐成功")
+                        else:
+                            logger(
+                                "Sentinel Browser did 二次对齐仍未匹配，保留最新 token"
+                            )
+
             try:
                 parsed = json.loads(token)
                 logger(
                     "Sentinel Browser 成功: "
                     f"p={'✓' if parsed.get('p') else '✗'} "
                     f"t={'✓' if parsed.get('t') else '✗'} "
-                    f"c={'✓' if parsed.get('c') else '✗'}"
+                    f"c={'✓' if parsed.get('c') else '✗'} "
+                    f"id={'✓' if parsed.get('id') else '✗'}"
                 )
             except Exception:
                 logger(f"Sentinel Browser 成功: len={len(token)}")

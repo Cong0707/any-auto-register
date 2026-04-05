@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 import unittest
@@ -152,7 +153,7 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
     @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthManager")
     @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthClient")
     @mock.patch("platforms.chatgpt.refresh_token_registration_engine.ChatGPTClient")
-    def test_run_retry_uses_newly_created_email_in_next_attempt(
+    def test_run_disables_full_flow_retry_even_if_max_retries_is_large(
         self,
         mock_chatgpt_client_cls,
         mock_oauth_client_cls,
@@ -214,10 +215,11 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         )
         result = engine.run()
 
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
+        self.assertIn("注册状态机失败", result.error_message)
         call_args = register_client.register_complete_flow.call_args_list
         self.assertEqual(call_args[0].args[0], "user1@example.com")
-        self.assertEqual(call_args[1].args[0], "user2@example.com")
+        self.assertEqual(len(call_args), 1)
 
 
 class OAuthClientPasswordlessTests(unittest.TestCase):
@@ -266,6 +268,32 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertEqual(submit_continue.call_args.kwargs["screen_hint"], "login")
         send_passwordless.assert_called_once()
         submit_password.assert_not_called()
+
+    def test_build_sentinel_token_for_flow_syncs_device_id_from_token(self):
+        client = self._make_client()
+        client.device_id = "did-old"
+        token = json.dumps(
+            {
+                "p": "gAAAAAB-test",
+                "t": "ok",
+                "c": "challenge",
+                "id": "did-new",
+                "flow": "authorize_continue",
+            },
+            separators=(",", ":"),
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.build_sentinel_token",
+            return_value=token,
+        ):
+            result = client._build_sentinel_token_for_flow(
+                flow="authorize_continue",
+                device_id="did-old",
+            )
+
+        self.assertEqual(result, token)
+        self.assertEqual(client.device_id, "did-new")
 
     def test_login_and_get_tokens_visits_add_phone_continue_url_before_phone_branch(self):
         client = self._make_client()
@@ -328,7 +356,7 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
         )
 
-    def test_login_and_get_tokens_retries_once_when_add_phone_has_no_workspace(self):
+    def test_login_and_get_tokens_fails_fast_when_add_phone_has_no_workspace(self):
         client = self._make_client()
         add_phone_state = FlowState(
             page_type="add_phone",
@@ -350,8 +378,8 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             )
 
         self.assertIsNone(tokens)
-        self.assertEqual(bootstrap.call_count, 2)
-        self.assertEqual(submit_continue.call_count, 2)
+        self.assertEqual(bootstrap.call_count, 1)
+        self.assertEqual(submit_continue.call_count, 1)
         self.assertIn("未获取到 workspace / callback", client.last_error)
 
     def test_send_passwordless_login_otp_does_not_send_email_field(self):

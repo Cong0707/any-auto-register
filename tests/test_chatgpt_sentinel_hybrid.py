@@ -103,6 +103,25 @@ class SentinelHybridTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 1)
         self.assertEqual(calls[0], "python")
 
+    def test_browser_device_mismatch_can_adopt_token_device_id(self):
+        flow = "authorize_continue"
+        did = "dev-4"
+        browser_did = "dev-browser-4"
+        browser_token = _mk_token(flow=flow, device_id=browser_did, t="ok")
+
+        with patch.object(sentinel_token, "_build_sentinel_token_browser", return_value=browser_token) as browser_mock, \
+             patch.object(sentinel_token, "_build_sentinel_token_python", return_value=None) as python_mock:
+            token = sentinel_token.build_sentinel_token(
+                session=object(),
+                device_id=did,
+                flow=flow,
+                use_cache=False,
+            )
+
+        self.assertEqual(token, browser_token)
+        self.assertEqual(browser_mock.call_count, 1)
+        self.assertEqual(python_mock.call_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

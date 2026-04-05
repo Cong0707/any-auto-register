@@ -158,6 +158,46 @@ class OAuthClient:
     def _replay_headers(self, step: str, dynamic_headers: dict | None = None) -> dict:
         return self._header_snapshots.get_for_replay(step, dynamic_headers)
 
+    def _current_device_id(self, fallback: str = "") -> str:
+        current = str(self.device_id or "").strip()
+        value = current or str(fallback or "").strip()
+        if value and value != current:
+            self.device_id = value
+            seed_oai_device_cookie(self.session, value)
+        return value
+
+    @staticmethod
+    def _extract_sentinel_device_id(token: str | None) -> str:
+        raw = str(token or "").strip()
+        if not raw:
+            return ""
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("id") or "").strip()
+
+    def _sync_device_id_from_sentinel_token(
+        self,
+        *,
+        expected_device_id: str,
+        token: str | None,
+        stage: str = "sentinel",
+    ) -> str:
+        expected = str(expected_device_id or "").strip()
+        token_device_id = self._extract_sentinel_device_id(token)
+        if token_device_id and expected and token_device_id != expected:
+            self._log(
+                f"{stage}: Sentinel did 对齐: expected={expected}, token={token_device_id}"
+            )
+        effective = token_device_id or expected
+        if effective:
+            self.device_id = effective
+            seed_oai_device_cookie(self.session, effective)
+        return effective
+
     def _build_sentinel_token_for_flow(
         self,
         *,
@@ -179,9 +219,10 @@ class OAuthClient:
             "chatgpt_sentinel_use_cache",
             default=True,
         )
-        return build_sentinel_token(
+        requested_device_id = self._current_device_id(device_id)
+        token = build_sentinel_token(
             self.session,
-            device_id,
+            requested_device_id,
             flow=flow,
             user_agent=user_agent,
             sec_ch_ua=sec_ch_ua,
@@ -193,6 +234,12 @@ class OAuthClient:
             use_cache=use_cache,
             log_fn=lambda msg: self._log(f"{stage}: {msg}"),
         )
+        self._sync_device_id_from_sentinel_token(
+            expected_device_id=requested_device_id,
+            token=token,
+            stage=stage,
+        )
+        return token
 
     def _start_flow_signature(self, *, device_id: str, oauth_state: str = "") -> None:
         did = str(device_id or "").strip()
@@ -1235,6 +1282,7 @@ class OAuthClient:
         """提交邮箱，获取 OAuth 流程的第一页状态。"""
         self._enter_stage("authorize_continue", f"email={email}")
         self._log("步骤2: POST /api/accounts/authorize/continue")
+        device_id = self._current_device_id(device_id)
 
         self._log(f"authorize_continue: device_id={device_id}")
         sentinel_token = self._build_sentinel_token_for_flow(
@@ -1249,6 +1297,7 @@ class OAuthClient:
         if not sentinel_token:
             self._set_error("无法获取 sentinel token (authorize_continue)")
             return None
+        device_id = self._current_device_id(device_id)
 
         request_url = f"{self.oauth_issuer}/api/accounts/authorize/continue"
         headers = self._headers(
@@ -1350,6 +1399,7 @@ class OAuthClient:
     ):
         """提交密码，获取下一步状态。"""
         self._log("步骤3: POST /api/accounts/password/verify")
+        device_id = self._current_device_id(device_id)
 
         self._log(f"password_verify: device_id={device_id}")
         sentinel_pwd = self._build_sentinel_token_for_flow(
@@ -1364,6 +1414,7 @@ class OAuthClient:
         if not sentinel_pwd:
             self._set_error("无法获取 sentinel token (password_verify)")
             return None
+        device_id = self._current_device_id(device_id)
 
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"
         headers = self._headers(
@@ -1422,6 +1473,7 @@ class OAuthClient:
     ):
         """在 login_password 状态下直接切到 passwordless OTP。"""
         self._log("步骤3: 命中 login_password，按新链路直接触发 passwordless OTP")
+        device_id = self._current_device_id(device_id)
 
         request_url = f"{self.oauth_issuer}/api/accounts/passwordless/send-otp"
         headers = self._headers(
@@ -1487,6 +1539,7 @@ class OAuthClient:
         """在 OAuth signup 流程中提交邮箱+密码。"""
         self._enter_stage("authorize_continue", f"register_user email={email}")
         self._log("步骤3: 命中 create_account_password，提交注册密码")
+        device_id = self._current_device_id(device_id)
 
         request_url = f"{self.oauth_issuer}/api/accounts/user/register"
         headers = self._headers(
@@ -1514,6 +1567,7 @@ class OAuthClient:
             stage="username_password_create",
         )
         if sentinel_token:
+            device_id = self._current_device_id(device_id)
             headers["openai-sentinel-token"] = sentinel_token
 
         payload = {
@@ -1929,6 +1983,7 @@ class OAuthClient:
         """在 OAuth 登录态命中 about_you 后提交资料，完成账户创建。"""
         self._enter_stage("about_you", "submit create_account")
         self._log("步骤5: 命中 about_you，提交姓名和生日完成注册")
+        device_id = self._current_device_id(device_id)
         self._log(
             "about_you 参数: "
             f"first_name={'已设置' if str(first_name or '').strip() else '缺失'}, "
@@ -2008,6 +2063,7 @@ class OAuthClient:
                     self._set_error("无法获取 sentinel token (oauth_create_account)")
                     return None
 
+                device_id = self._current_device_id(device_id)
                 r = _post_create(sentinel_token)
                 self._log(f"/create_account(重试) -> {r.status_code}")
                 self._log(
@@ -2431,44 +2487,11 @@ class OAuthClient:
                         continue
 
                     workspace_error = str(self.last_error or "").strip()
-                    if prefer_passwordless_login and _continue_depth < 1:
-                        self._log(
-                            "步骤5: canonical consent 仍未拿到 workspace/callback"
-                            + (
-                                f" ({workspace_error})"
-                                if workspace_error
-                                else ""
-                            )
-                            + "，重启一次全新 OAuth session + 新 PKCE"
-                        )
-                        self._recreate_session()
-                        return self.login_and_get_tokens(
-                            email,
-                            password,
-                            device_id,
-                            user_agent=user_agent,
-                            sec_ch_ua=sec_ch_ua,
-                            impersonate=impersonate,
-                            skymail_client=skymail_client,
-                            prefer_passwordless_login=prefer_passwordless_login,
-                            allow_phone_verification=allow_phone_verification,
-                            complete_about_you_if_needed=complete_about_you_if_needed,
-                            first_name=first_name,
-                            last_name=last_name,
-                            birthdate=birthdate,
-                            login_source=(
-                                f"{login_source}:add_phone_continue"
-                                if login_source
-                                else "add_phone_continue"
-                            ),
-                            _continue_depth=_continue_depth + 1,
-                        )
-                    else:
-                        self._set_error(
-                            "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
-                            + (f" ({workspace_error})" if workspace_error else "")
-                        )
-                        return None
+                    self._set_error(
+                        "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
+                        + (f" ({workspace_error})" if workspace_error else "")
+                    )
+                    return None
                 else:
                     next_state = self._handle_add_phone_verification(
                         device_id,
@@ -2582,6 +2605,7 @@ class OAuthClient:
     ):
         """提交 workspace 和 organization 选择（带重试）"""
         self._enter_stage("workspace_select", consent_url[:120] if consent_url else "")
+        device_id = self._current_device_id(device_id)
         session_data = None
 
         for attempt in range(max_retries):
@@ -3484,6 +3508,7 @@ class OAuthClient:
         # 记录 OTP 发送时间基线——必须在 sentinel token 等耗时操作之前，
         # 否则邮件 created_at 会早于 otp_cutoff 导致验证码被误判为旧邮件。
         _otp_sent_at_baseline = time.time()
+        device_id = self._current_device_id(device_id)
 
         def _resend_email_otp() -> bool:
             prefer_passwordless = bool(
@@ -3575,6 +3600,7 @@ class OAuthClient:
         )
         if not sentinel_otp:
             self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
+        device_id = self._current_device_id(device_id)
 
         def _build_otp_headers():
             extra_headers = {
