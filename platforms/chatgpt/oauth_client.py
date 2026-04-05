@@ -2613,7 +2613,11 @@ class OAuthClient:
                 user_agent=user_agent,
                 impersonate=impersonate,
             )
-            if session_data:
+            if (
+                isinstance(session_data, dict)
+                and isinstance(session_data.get("workspaces"), list)
+                and session_data.get("workspaces")
+            ):
                 break
 
             if attempt < max_retries - 1:
@@ -2887,7 +2891,7 @@ class OAuthClient:
             self._log(f"session provenance 选择: {reason}")
             return selected
 
-        return self._clean_session_data(cookie_data) if cookie_data else None
+        return None
 
     def _fetch_consent_page_html(self, consent_url, user_agent, impersonate):
         """获取 consent 页 HTML，用于解析 React Router stream 中的 session 数据。"""
@@ -3018,7 +3022,11 @@ class OAuthClient:
             for cookie in self.session.cookies:
                 try:
                     name = cookie.name if hasattr(cookie, "name") else str(cookie)
-                    if name == "oai-client-auth-session":
+                    normalized_name = str(name or "").strip().lower()
+                    if normalized_name in {
+                        "oai-client-auth-session",
+                        "__secure-oai-client-auth-session",
+                    } or normalized_name.endswith("oai-client-auth-session"):
                         value = (
                             cookie.value
                             if hasattr(cookie, "value")
@@ -3036,23 +3044,46 @@ class OAuthClient:
         return None
 
     @staticmethod
-    def _decode_cookie_json_value(value):
+    def _score_decoded_cookie_payload(payload: dict | None) -> float:
+        data = payload if isinstance(payload, dict) else {}
+        score = 0.0
+
+        workspaces = data.get("workspaces")
+        if isinstance(workspaces, list) and workspaces:
+            score += 5.0
+
+        if str(data.get("session_id") or "").strip():
+            score += 1.2
+        if str(data.get("openai_client_id") or "").strip():
+            score += 1.0
+
+        # add_phone/phone 验证链路也依赖这些字段
+        if str(data.get("phone_verification_channel") or "").strip():
+            score += 0.8
+        if str(data.get("phone_number") or "").strip():
+            score += 0.6
+
+        # JWT header（alg/typ）不应被误判为 session payload
+        keys = {str(k).lower() for k in data.keys()}
+        if keys <= {"alg", "typ", "kid"}:
+            score -= 2.0
+        return score
+
+    @classmethod
+    def _decode_cookie_json_value(cls, value):
         import base64
         import json
+        import urllib.parse
 
         raw_value = str(value or "").strip()
         if not raw_value:
             return None
 
-        candidates = [raw_value]
-        if "." in raw_value:
-            candidates.insert(0, raw_value.split(".", 1)[0])
-
-        for candidate in candidates:
-            candidate = candidate.strip()
-            if not candidate:
-                continue
-            padded = candidate + "=" * (-len(candidate) % 4)
+        def _decode_segment(segment: str) -> dict | None:
+            seg = str(segment or "").strip()
+            if not seg:
+                return None
+            padded = seg + "=" * (-len(seg) % 4)
             for decoder in (base64.urlsafe_b64decode, base64.b64decode):
                 try:
                     decoded = decoder(padded).decode("utf-8")
@@ -3061,6 +3092,77 @@ class OAuthClient:
                     continue
                 if isinstance(parsed, dict):
                     return parsed
+            return None
+
+        candidates = []
+        for item in (
+            raw_value,
+            urllib.parse.unquote(raw_value),
+            raw_value.strip('"'),
+            urllib.parse.unquote(raw_value).strip('"'),
+        ):
+            text = str(item or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+
+        best_payload = None
+        best_score = float("-inf")
+
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            parsed_candidates: list[dict] = []
+
+            # 1) 直接 JSON
+            try:
+                direct = json.loads(candidate)
+                if isinstance(direct, dict):
+                    parsed_candidates.append(direct)
+            except Exception:
+                pass
+
+            # 2) JWT/分段 payload（优先尝试每一段，避免误取 header）
+            if "." in candidate:
+                segments = [item for item in candidate.split(".") if item]
+                for segment in segments:
+                    parsed = _decode_segment(segment)
+                    if isinstance(parsed, dict):
+                        parsed_candidates.append(parsed)
+
+            # 3) 整体 base64 内容
+            parsed_all = _decode_segment(candidate)
+            if isinstance(parsed_all, dict):
+                parsed_candidates.append(parsed_all)
+
+            for parsed in parsed_candidates:
+                try:
+                    score = cls._score_decoded_cookie_payload(parsed)
+                except Exception:
+                    score = -999.0
+                if score > best_score:
+                    best_payload = parsed
+                    best_score = score
+
+        if best_payload is not None:
+            return best_payload
+
+        # 兜底：兼容旧格式（保持行为稳定）
+        for candidate in candidates:
+            parsed = _decode_segment(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+            if "." in candidate:
+                for segment in candidate.split("."):
+                    parsed = _decode_segment(segment)
+                    if isinstance(parsed, dict):
+                        return parsed
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
 
         return None
 
