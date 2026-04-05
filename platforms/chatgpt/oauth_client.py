@@ -28,8 +28,9 @@ from .utils import (
     random_delay,
     seed_oai_device_cookie,
 )
+from .http_replay import run_http_step_with_replay
+from .flow_signature import FlowSignatureContext, HeaderSnapshotStore
 from .sentinel_token import build_sentinel_token
-from .sentinel_browser import get_sentinel_token_via_browser
 
 
 class OAuthClient:
@@ -64,6 +65,12 @@ class OAuthClient:
         self.ua = ""
         self.sec_ch_ua = ""
         self.impersonate = ""
+        self._flow_signature_ctx: FlowSignatureContext | None = None
+        self._header_snapshots = HeaderSnapshotStore()
+        self._workspace_success_hist: dict[str, int] = {}
+        self._workspace_fail_hist: dict[str, int] = {}
+        self._org_success_hist: dict[str, int] = {}
+        self._org_fail_hist: dict[str, int] = {}
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -117,6 +124,106 @@ class OAuthClient:
         """输出日志"""
         if self.verbose:
             print(f"  [OAuth] {msg}")
+
+    def _resolve_bool_config(self, *keys: str, default: bool = False) -> bool:
+        for key in keys:
+            if key not in self.config:
+                continue
+            raw = str(self.config.get(key, "") or "").strip().lower()
+            if not raw:
+                continue
+            if raw in {"1", "true", "yes", "on"}:
+                return True
+            if raw in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    def _resolve_int_config(self, *keys: str, default: int, min_value: int = 0, max_value: int = 9999) -> int:
+        for key in keys:
+            if key not in self.config:
+                continue
+            raw = str(self.config.get(key, "") or "").strip()
+            if not raw:
+                continue
+            try:
+                value = int(float(raw))
+                return max(min_value, min(value, max_value))
+            except Exception:
+                continue
+        return default
+
+    def _capture_headers_once(self, step: str, headers: dict) -> dict:
+        return self._header_snapshots.capture(step, headers)
+
+    def _replay_headers(self, step: str, dynamic_headers: dict | None = None) -> dict:
+        return self._header_snapshots.get_for_replay(step, dynamic_headers)
+
+    def _build_sentinel_token_for_flow(
+        self,
+        *,
+        flow: str,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        page_url: str | None = None,
+        stage: str = "sentinel",
+    ) -> str | None:
+        prefer_browser = self._resolve_bool_config(
+            "sentinel_prefer_browser",
+            "chatgpt_sentinel_prefer_browser",
+            default=True,
+        )
+        use_cache = self._resolve_bool_config(
+            "sentinel_use_cache",
+            "chatgpt_sentinel_use_cache",
+            default=True,
+        )
+        return build_sentinel_token(
+            self.session,
+            device_id,
+            flow=flow,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            proxy=self.proxy,
+            page_url=page_url,
+            headless=self.browser_mode != "headed",
+            prefer_browser=prefer_browser,
+            use_cache=use_cache,
+            log_fn=lambda msg: self._log(f"{stage}: {msg}"),
+        )
+
+    def _start_flow_signature(self, *, device_id: str, oauth_state: str = "") -> None:
+        did = str(device_id or "").strip()
+        if not did:
+            self._flow_signature_ctx = None
+            self._header_snapshots.clear()
+            return
+        self._flow_signature_ctx = FlowSignatureContext.create(
+            device_id=did,
+            oauth_state=str(oauth_state or "").strip(),
+        )
+        self._header_snapshots.clear()
+        self._log(
+            "flow_signature 初始化: "
+            f"flow_id={self._flow_signature_ctx.flow_id[:8]}..., "
+            f"trace_id={self._flow_signature_ctx.trace_id}, "
+            f"auth_session_logging_id={self._flow_signature_ctx.auth_session_logging_id[:8]}..."
+        )
+
+    def _trace_headers(self, step: str, attempt: int = 1) -> dict[str, str]:
+        if self._flow_signature_ctx is None:
+            return generate_datadog_trace()
+        return self._flow_signature_ctx.datadog_headers(step=step, attempt=attempt)
+
+    def _inject_authorize_tracking_params(self, params: dict, *, device_id: str) -> dict:
+        payload = dict(params or {})
+        if self._flow_signature_ctx is not None:
+            return self._flow_signature_ctx.build_authorize_params(payload)
+        payload.setdefault("ext-oai-did", str(device_id or "").strip())
+        payload.setdefault("auth_session_logging_id", str(uuid.uuid4()))
+        return payload
 
     def _enter_stage(self, stage: str, detail: str = ""):
         self.last_stage = str(stage or "").strip()
@@ -462,6 +569,347 @@ class OAuthClient:
         session_data = self._decode_oauth_session_cookie() or {}
         return bool(session_data.get("workspaces"))
 
+    @staticmethod
+    def _safe_ratio(success: int, fail: int) -> float:
+        total = int(success or 0) + int(fail or 0)
+        if total <= 0:
+            return 0.0
+        return float(success) / float(total)
+
+    def _workspace_history_bias(self, workspace_id: str) -> float:
+        wid = str(workspace_id or "").strip()
+        if not wid:
+            return 0.0
+        success = self._workspace_success_hist.get(wid, 0)
+        fail = self._workspace_fail_hist.get(wid, 0)
+        ratio = self._safe_ratio(success, fail)
+        if success + fail < 2:
+            return 0.0
+        return (ratio - 0.5) * 1.5
+
+    def _org_history_bias(self, org_id: str) -> float:
+        oid = str(org_id or "").strip()
+        if not oid:
+            return 0.0
+        success = self._org_success_hist.get(oid, 0)
+        fail = self._org_fail_hist.get(oid, 0)
+        ratio = self._safe_ratio(success, fail)
+        if success + fail < 2:
+            return 0.0
+        return (ratio - 0.5) * 1.2
+
+    def _record_workspace_outcome(self, workspace_id: str, ok: bool) -> None:
+        wid = str(workspace_id or "").strip()
+        if not wid:
+            return
+        if ok:
+            self._workspace_success_hist[wid] = int(self._workspace_success_hist.get(wid, 0)) + 1
+        else:
+            self._workspace_fail_hist[wid] = int(self._workspace_fail_hist.get(wid, 0)) + 1
+
+    def _record_org_outcome(self, org_id: str, ok: bool) -> None:
+        oid = str(org_id or "").strip()
+        if not oid:
+            return
+        if ok:
+            self._org_success_hist[oid] = int(self._org_success_hist.get(oid, 0)) + 1
+        else:
+            self._org_fail_hist[oid] = int(self._org_fail_hist.get(oid, 0)) + 1
+
+    def _score_workspace(self, workspace: dict) -> float:
+        item = workspace if isinstance(workspace, dict) else {}
+        workspace_id = str(item.get("id") or "").strip()
+        if not workspace_id:
+            return -9999.0
+
+        score = 0.0
+        if bool(item.get("is_default")):
+            score += 2.0
+        role = str(item.get("role") or "").strip().lower()
+        if role in {"owner", "admin"}:
+            score += 1.0
+        projects = item.get("projects")
+        if isinstance(projects, list):
+            score += min(len(projects), 4) * 0.25
+        org_id = ""
+        if isinstance(item.get("organization"), dict):
+            org_id = str((item.get("organization") or {}).get("id") or "").strip()
+        if org_id:
+            score += 0.4
+        score += self._workspace_history_bias(workspace_id)
+        return score
+
+    def _select_best_workspace(self, workspaces: list[dict]) -> dict | None:
+        candidates = [item for item in (workspaces or []) if isinstance(item, dict)]
+        if not candidates:
+            return None
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                self._score_workspace(item),
+                str(item.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        return ranked[0]
+
+    def _score_org(self, org: dict) -> float:
+        item = org if isinstance(org, dict) else {}
+        org_id = str(item.get("id") or "").strip()
+        if not org_id:
+            return -9999.0
+        score = 0.0
+        if bool(item.get("is_default")):
+            score += 2.0
+        role = str(item.get("role") or "").strip().lower()
+        if role in {"owner", "admin"}:
+            score += 1.0
+        projects = item.get("projects")
+        if isinstance(projects, list):
+            score += min(len(projects), 4) * 0.3
+        score += self._org_history_bias(org_id)
+        return score
+
+    def _select_best_org(self, orgs: list[dict]) -> tuple[dict | None, str]:
+        candidates = [item for item in (orgs or []) if isinstance(item, dict)]
+        if not candidates:
+            return None, ""
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                self._score_org(item),
+                str(item.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        selected = ranked[0]
+        projects = selected.get("projects")
+        project_id = ""
+        if isinstance(projects, list) and projects:
+            project = projects[0] if isinstance(projects[0], dict) else {}
+            project_id = str(project.get("id") or "").strip()
+        return selected, project_id
+
+    @staticmethod
+    def _clean_session_data(session_data: dict | None) -> dict:
+        payload = dict(session_data) if isinstance(session_data, dict) else {}
+        raw_workspaces = (
+            payload.get("workspaces")
+            if isinstance(payload.get("workspaces"), list)
+            else []
+        )
+        normalized_workspaces = []
+        seen = set()
+        for item in raw_workspaces:
+            if not isinstance(item, dict):
+                continue
+            wid = str(item.get("id") or "").strip()
+            if not wid or wid in seen:
+                continue
+            seen.add(wid)
+            normalized_workspaces.append(dict(item))
+        payload["workspaces"] = normalized_workspaces
+        if "session_id" in payload:
+            payload["session_id"] = str(payload.get("session_id") or "").strip()
+        if "openai_client_id" in payload:
+            payload["openai_client_id"] = str(payload.get("openai_client_id") or "").strip()
+        return payload
+
+    @classmethod
+    def _score_session_data_provenance(
+        cls, session_data: dict | None, *, source: str
+    ) -> float:
+        payload = cls._clean_session_data(session_data)
+        workspaces = payload.get("workspaces") if isinstance(payload.get("workspaces"), list) else []
+        if not workspaces:
+            return 0.0
+
+        source_name = str(source or "").strip().lower()
+        score = 0.52 if source_name == "cookie" else 0.47
+
+        if str(payload.get("session_id") or "").strip():
+            score += 0.13
+        if str(payload.get("openai_client_id") or "").strip():
+            score += 0.13
+
+        score += 0.14
+        score += min(len(workspaces), 3) * 0.04
+
+        _, org_ids = cls._extract_workspace_org_ids_from_session(payload)
+        if org_ids:
+            score += 0.08
+
+        rich_workspace_count = 0
+        for item in workspaces:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("projects"), list) and item.get("projects"):
+                rich_workspace_count += 1
+        score += min(rich_workspace_count, 2) * 0.03
+        return max(0.0, min(score, 1.0))
+
+    @staticmethod
+    def _merge_workspace_lists(primary: list[dict], secondary: list[dict]) -> list[dict]:
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+
+        def _non_empty_score(data: dict) -> int:
+            score = 0
+            for value in (data or {}).values():
+                if value in ("", None, [], {}):
+                    continue
+                score += 1
+            return score
+
+        def _fill_missing(dst: dict, src: dict) -> dict:
+            combined = dict(dst or {})
+            for key, value in (src or {}).items():
+                if key not in combined or combined.get(key) in ("", None, [], {}):
+                    if value not in ("", None, [], {}):
+                        combined[key] = value
+            return combined
+
+        def _push(items: list[dict]):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                wid = str(item.get("id") or "").strip()
+                if not wid:
+                    continue
+                candidate = dict(item)
+                if wid not in merged:
+                    merged[wid] = candidate
+                    order.append(wid)
+                    continue
+
+                current = merged[wid]
+                if _non_empty_score(candidate) > _non_empty_score(current):
+                    merged[wid] = _fill_missing(candidate, current)
+                else:
+                    merged[wid] = _fill_missing(current, candidate)
+
+        _push(primary or [])
+        _push(secondary or [])
+        return [merged[wid] for wid in order]
+
+    def _select_session_data_with_provenance(
+        self,
+        cookie_session: dict | None,
+        html_session: dict | None,
+    ) -> tuple[dict | None, str]:
+        cookie_payload = self._clean_session_data(cookie_session)
+        html_payload = self._clean_session_data(html_session)
+
+        cookie_workspace_ids, cookie_org_ids = self._extract_workspace_org_ids_from_session(
+            cookie_payload
+        )
+        html_workspace_ids, html_org_ids = self._extract_workspace_org_ids_from_session(
+            html_payload
+        )
+
+        cookie_score = self._score_session_data_provenance(cookie_payload, source="cookie")
+        html_score = self._score_session_data_provenance(html_payload, source="html")
+
+        if not cookie_workspace_ids and not html_workspace_ids:
+            if cookie_payload:
+                return cookie_payload, "cookie_only_without_workspace"
+            if html_payload:
+                return html_payload, "html_only_without_workspace"
+            return None, "no_session_data"
+
+        if cookie_workspace_ids and not html_workspace_ids:
+            return cookie_payload, f"cookie_only(score={cookie_score:.2f})"
+
+        if html_workspace_ids and not cookie_workspace_ids:
+            return html_payload, f"html_only(score={html_score:.2f})"
+
+        workspace_union = cookie_workspace_ids | html_workspace_ids
+        workspace_overlap = len(cookie_workspace_ids & html_workspace_ids) / max(
+            len(workspace_union), 1
+        )
+
+        org_union = cookie_org_ids | html_org_ids
+        if org_union:
+            org_overlap = len(cookie_org_ids & html_org_ids) / float(len(org_union))
+        else:
+            org_overlap = 1.0
+
+        if workspace_overlap <= 0.0:
+            if html_score > cookie_score + 0.08:
+                return (
+                    html_payload,
+                    f"conflict_choose_html(cookie={cookie_score:.2f},html={html_score:.2f})",
+                )
+            return (
+                cookie_payload,
+                f"conflict_choose_cookie(cookie={cookie_score:.2f},html={html_score:.2f})",
+            )
+
+        merged = dict(cookie_payload)
+        if not str(merged.get("session_id") or "").strip():
+            merged["session_id"] = str(html_payload.get("session_id") or "").strip()
+        if not str(merged.get("openai_client_id") or "").strip():
+            merged["openai_client_id"] = str(html_payload.get("openai_client_id") or "").strip()
+        merged["workspaces"] = self._merge_workspace_lists(
+            cookie_payload.get("workspaces", []),
+            html_payload.get("workspaces", []),
+        )
+        merged_score = max(cookie_score, html_score)
+        merged_score += workspace_overlap * 0.12
+        merged_score += org_overlap * 0.06
+
+        if merged_score + 0.01 >= max(cookie_score, html_score):
+            return (
+                merged,
+                "merged("
+                f"cookie={cookie_score:.2f},"
+                f"html={html_score:.2f},"
+                f"ws_overlap={workspace_overlap:.2f},"
+                f"org_overlap={org_overlap:.2f})",
+            )
+
+        if cookie_score >= html_score:
+            return (
+                cookie_payload,
+                f"choose_cookie(cookie={cookie_score:.2f},html={html_score:.2f})",
+            )
+        return (
+            html_payload,
+            f"choose_html(cookie={cookie_score:.2f},html={html_score:.2f})",
+        )
+
+    @staticmethod
+    def _extract_workspace_org_ids_from_session(session_data: dict | None) -> tuple[set[str], set[str]]:
+        payload = session_data if isinstance(session_data, dict) else {}
+        workspaces = payload.get("workspaces") if isinstance(payload.get("workspaces"), list) else []
+        workspace_ids: set[str] = set()
+        org_ids: set[str] = set()
+        for workspace in workspaces:
+            if not isinstance(workspace, dict):
+                continue
+            wid = str(workspace.get("id") or "").strip()
+            if wid:
+                workspace_ids.add(wid)
+            org = workspace.get("organization") if isinstance(workspace.get("organization"), dict) else {}
+            oid = str(org.get("id") or "").strip()
+            if oid:
+                org_ids.add(oid)
+        return workspace_ids, org_ids
+
+    def _validate_session_provenance(
+        self,
+        *,
+        session_data: dict | None,
+        expected_workspace_id: str = "",
+        expected_org_id: str = "",
+    ) -> tuple[bool, str]:
+        workspace_ids, org_ids = self._extract_workspace_org_ids_from_session(session_data)
+        if expected_workspace_id and workspace_ids and expected_workspace_id not in workspace_ids:
+            return False, f"workspace 不在当前会话中: {expected_workspace_id}"
+        if expected_org_id and org_ids and expected_org_id not in org_ids:
+            return False, f"organization 不在当前会话中: {expected_org_id}"
+        return True, ""
+
     def _follow_flow_state(
         self,
         state: FlowState,
@@ -569,6 +1017,7 @@ class OAuthClient:
                 referer="https://chatgpt.com/",
                 navigation=True,
             )
+            headers.update(self._trace_headers("bootstrap_oauth_session.authorize"))
             kwargs = {
                 "params": authorize_params,
                 "headers": headers,
@@ -599,16 +1048,20 @@ class OAuthClient:
         self._log("未获取到 login_session，尝试 /api/oauth/oauth2/auth...")
         try:
             oauth2_url = f"{self.oauth_issuer}/api/oauth/oauth2/auth"
+            oauth2_headers = self._headers(
+                oauth2_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                referer="https://chatgpt.com/",
+                navigation=True,
+            )
+            oauth2_headers.update(
+                self._trace_headers("bootstrap_oauth_session.oauth2_auth")
+            )
             kwargs = {
                 "params": authorize_params,
-                "headers": self._headers(
-                    oauth2_url,
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    referer="https://chatgpt.com/",
-                    navigation=True,
-                ),
+                "headers": oauth2_headers,
                 "allow_redirects": True,
                 "timeout": 30,
             }
@@ -694,32 +1147,35 @@ class OAuthClient:
         authorize_url = ""
         try:
             self._log("force_chatgpt_entry: 提交邮箱获取 authorize URL...")
-            params = {
-                "prompt": "login",
-                "ext-oai-did": device_id,
-                "auth_session_logging_id": str(uuid.uuid4()),
-                "screen_hint": "login_or_signup",
-                "login_hint": email,
-            }
+            params = self._inject_authorize_tracking_params(
+                {
+                    "prompt": "login",
+                    "screen_hint": "login_or_signup",
+                    "login_hint": email,
+                },
+                device_id=device_id,
+            )
             form_data = {
                 "callbackUrl": "https://chatgpt.com/",
                 "csrfToken": csrf_token,
                 "json": "true",
             }
+            signin_headers = self._headers(
+                signin_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=homepage_url,
+                origin="https://chatgpt.com",
+                content_type="application/x-www-form-urlencoded",
+                fetch_site="same-origin",
+            )
+            signin_headers.update(self._trace_headers("bootstrap_chatgpt_entry.signin"))
             r_signin = self.session.post(
                 signin_url,
                 params=params,
                 data=form_data,
-                headers=self._headers(
-                    signin_url,
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    accept="application/json",
-                    referer=homepage_url,
-                    origin="https://chatgpt.com",
-                    content_type="application/x-www-form-urlencoded",
-                    fetch_site="same-origin",
-                ),
+                headers=signin_headers,
                 timeout=30,
             )
             if r_signin.status_code == 200:
@@ -781,30 +1237,18 @@ class OAuthClient:
         self._log("步骤2: POST /api/accounts/authorize/continue")
 
         self._log(f"authorize_continue: device_id={device_id}")
-        sentinel_token = get_sentinel_token_via_browser(
+        sentinel_token = self._build_sentinel_token_for_flow(
             flow="authorize_continue",
-            proxy=self.proxy,
-            page_url=continue_referer or f"{self.oauth_issuer}/log-in",
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            page_url=continue_referer or f"{self.oauth_issuer}/log-in",
+            stage="authorize_continue",
         )
-        if sentinel_token:
-            self._log("authorize_continue: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="authorize_continue",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_token:
-                self._log("authorize_continue: 已通过 HTTP PoW 获取 token")
-            else:
-                self._set_error("无法获取 sentinel token (authorize_continue)")
-                return None
+        if not sentinel_token:
+            self._set_error("无法获取 sentinel token (authorize_continue)")
+            return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/authorize/continue"
         headers = self._headers(
@@ -821,7 +1265,7 @@ class OAuthClient:
                 "openai-sentinel-token": sentinel_token,
             },
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
         payload = {"username": {"kind": "email", "value": email}}
         if screen_hint:
             payload["screen_hint"] = str(screen_hint).strip()
@@ -867,7 +1311,7 @@ class OAuthClient:
                 )
                 headers["Referer"] = continue_referer
                 headers["Sec-Fetch-Site"] = "same-origin"
-                headers.update(generate_datadog_trace())
+                headers.update(self._trace_headers(self.last_stage or "oauth_step"))
                 kwargs = {
                     "json": payload,
                     "headers": headers,
@@ -908,30 +1352,18 @@ class OAuthClient:
         self._log("步骤3: POST /api/accounts/password/verify")
 
         self._log(f"password_verify: device_id={device_id}")
-        sentinel_pwd = get_sentinel_token_via_browser(
+        sentinel_pwd = self._build_sentinel_token_for_flow(
             flow="password_verify",
-            proxy=self.proxy,
-            page_url=referer or f"{self.oauth_issuer}/log-in/password",
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"password_verify: {msg}"),
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            page_url=referer or f"{self.oauth_issuer}/log-in/password",
+            stage="password_verify",
         )
-        if sentinel_pwd:
-            self._log("password_verify: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_pwd = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="password_verify",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_pwd:
-                self._log("password_verify: 已通过 HTTP PoW 获取 token")
-            else:
-                self._set_error("无法获取 sentinel token (password_verify)")
-                return None
+        if not sentinel_pwd:
+            self._set_error("无法获取 sentinel token (password_verify)")
+            return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"
         headers = self._headers(
@@ -948,7 +1380,7 @@ class OAuthClient:
                 "openai-sentinel-token": sentinel_pwd,
             },
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
         try:
             kwargs = {
@@ -1005,7 +1437,7 @@ class OAuthClient:
                 "oai-device-id": device_id,
             },
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
         try:
             kwargs = {
@@ -1070,29 +1502,17 @@ class OAuthClient:
                 "oai-device-id": device_id,
             },
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
-        sentinel_token = get_sentinel_token_via_browser(
+        sentinel_token = self._build_sentinel_token_for_flow(
             flow="username_password_create",
-            proxy=self.proxy,
-            page_url=referer or f"{self.oauth_issuer}/create-account/password",
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"username_password_create: {msg}"),
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            page_url=referer or f"{self.oauth_issuer}/create-account/password",
+            stage="username_password_create",
         )
-        if sentinel_token:
-            self._log("username_password_create: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="username_password_create",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_token:
-                self._log("username_password_create: 已通过 HTTP PoW 获取 token")
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
 
@@ -1151,7 +1571,7 @@ class OAuthClient:
             navigation=True,
             fetch_site="same-origin",
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
         try:
             kwargs = {
@@ -1250,7 +1670,10 @@ class OAuthClient:
 
         code_verifier, code_challenge = generate_pkce()
         oauth_state = secrets.token_urlsafe(32)
-        authorize_params = {
+        self._start_flow_signature(device_id=device_id, oauth_state=oauth_state)
+
+        authorize_params = self._inject_authorize_tracking_params(
+            {
             "response_type": "code",
             "client_id": self.oauth_client_id,
             "audience": "https://api.openai.com/v1",
@@ -1262,12 +1685,13 @@ class OAuthClient:
             "prompt": "login",
             "login_hint": email,
             "screen_hint": "login_or_signup",
-            "ext-oai-did": device_id,
-            "auth_session_logging_id": str(uuid.uuid4()),
             "ext-passkey-client-capabilities": "1111",
             "codex_cli_simplified_flow": "true",
             "id_token_add_organizations": "true",
-        }
+            }
+            ,
+            device_id=device_id,
+        )
         authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
         seed_oai_device_cookie(self.session, device_id)
@@ -1542,7 +1966,7 @@ class OAuthClient:
                 fetch_site="same-origin",
                 extra_headers=extra_headers,
             )
-            headers_local.update(generate_datadog_trace())
+            headers_local.update(self._trace_headers(self.last_stage or "oauth_step"))
             return headers_local
 
         def _post_create(sentinel_token: str = ""):
@@ -1571,13 +1995,14 @@ class OAuthClient:
                 or "challenge" in (r.text or "").lower()
             ):
                 self._log("create_account 首次请求需要额外挑战，补发 sentinel 后重试...")
-                sentinel_token = build_sentinel_token(
-                    self.session,
-                    device_id,
+                sentinel_token = self._build_sentinel_token_for_flow(
                     flow="oauth_create_account",
+                    device_id=device_id,
                     user_agent=user_agent,
                     sec_ch_ua=sec_ch_ua,
                     impersonate=impersonate,
+                    page_url=referer or f"{self.oauth_issuer}/about-you",
+                    stage="oauth_create_account",
                 )
                 if not sentinel_token:
                     self._set_error("无法获取 sentinel token (oauth_create_account)")
@@ -1719,7 +2144,9 @@ class OAuthClient:
 
         code_verifier, code_challenge = generate_pkce()
         oauth_state = secrets.token_urlsafe(32)
-        authorize_params = {
+        self._start_flow_signature(device_id=device_id, oauth_state=oauth_state)
+        authorize_params = self._inject_authorize_tracking_params(
+            {
             "response_type": "code",
             "client_id": self.oauth_client_id,
             "redirect_uri": self.oauth_redirect_uri,
@@ -1727,7 +2154,14 @@ class OAuthClient:
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "state": oauth_state,
-        }
+            "prompt": "login",
+            "login_hint": email,
+            "screen_hint": str(screen_hint or "login").strip() or "login",
+            "codex_cli_simplified_flow": "true",
+            "id_token_add_organizations": "true",
+        },
+            device_id=device_id,
+        )
         authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
         seed_oai_device_cookie(self.session, device_id)
@@ -2173,10 +2607,32 @@ class OAuthClient:
             self._set_error("session 中没有 workspace 信息")
             return None, None
 
-        workspace_id = (workspaces[0] or {}).get("id")
+        selected_workspace = self._select_best_workspace(workspaces)
+        workspace_id = (selected_workspace or {}).get("id")
         if not workspace_id:
             self._set_error("workspace_id 为空")
             return None, None
+
+        is_valid_workspace, workspace_reason = self._validate_session_provenance(
+            session_data=session_data,
+            expected_workspace_id=str(workspace_id or "").strip(),
+        )
+        if not is_valid_workspace:
+            self._log(f"workspace provenance 不一致，尝试回退: {workspace_reason}")
+            expected_workspace_ids, _ = self._extract_workspace_org_ids_from_session(session_data)
+            fallback_workspace = next(
+                (
+                    item
+                    for item in workspaces
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "").strip() in expected_workspace_ids
+                ),
+                None,
+            )
+            if fallback_workspace:
+                selected_workspace = fallback_workspace
+                workspace_id = str((selected_workspace or {}).get("id") or "").strip()
+                self._log(f"workspace provenance 回退选择: {workspace_id}")
 
         self.last_workspace_id = str(workspace_id).strip()
         self._log(f"选择 workspace: {workspace_id}")
@@ -2193,7 +2649,7 @@ class OAuthClient:
                 "oai-device-id": device_id,
             },
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
         try:
             kwargs = {
@@ -2213,6 +2669,10 @@ class OAuthClient:
             self._log(f"workspace/select -> {r.status_code}")
             self._log(
                 f"workspace/select 请求: workspace_id={workspace_id} consent_url={consent_url[:120]}"
+            )
+            self._record_workspace_outcome(
+                workspace_id=str(workspace_id or "").strip(),
+                ok=r.status_code in {200, 301, 302, 303, 307, 308},
             )
 
             # 检查重定向
@@ -2239,9 +2699,36 @@ class OAuthClient:
                     continue_url = workspace_state.continue_url
 
                     if orgs:
-                        org_id = (orgs[0] or {}).get("id")
-                        projects = (orgs[0] or {}).get("projects", [])
-                        project_id = (projects[0] or {}).get("id") if projects else None
+                        selected_org, selected_project_id = self._select_best_org(orgs)
+                        org_id = str((selected_org or {}).get("id") or "").strip()
+                        project_id = str(selected_project_id or "").strip() or None
+
+                        is_valid_org, org_reason = self._validate_session_provenance(
+                            session_data=session_data,
+                            expected_workspace_id=str(workspace_id or "").strip(),
+                            expected_org_id=str(org_id or "").strip(),
+                        )
+                        if not is_valid_org:
+                            self._log(f"organization provenance 不一致，尝试回退: {org_reason}")
+                            _, expected_org_ids = self._extract_workspace_org_ids_from_session(session_data)
+                            fallback_org = next(
+                                (
+                                    item
+                                    for item in orgs
+                                    if isinstance(item, dict)
+                                    and str(item.get("id") or "").strip() in expected_org_ids
+                                ),
+                                None,
+                            )
+                            if fallback_org:
+                                org_id = str(fallback_org.get("id") or "").strip()
+                                projects = fallback_org.get("projects") if isinstance(fallback_org.get("projects"), list) else []
+                                project_id = (
+                                    str((projects[0] or {}).get("id") or "").strip()
+                                    if projects
+                                    else None
+                                )
+                                self._log(f"organization provenance 回退选择: {org_id}")
 
                         if org_id:
                             self._log(f"选择 organization: {org_id}")
@@ -2267,7 +2754,7 @@ class OAuthClient:
                                     "oai-device-id": device_id,
                                 },
                             )
-                            headers.update(generate_datadog_trace())
+                            headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
                             kwargs = {
                                 "json": org_body,
@@ -2287,6 +2774,10 @@ class OAuthClient:
                             self._log(f"organization/select -> {r_org.status_code}")
                             self._log(
                                 f"organization/select 请求: org_id={org_id} project_id={project_id or '-'}"
+                            )
+                            self._record_org_outcome(
+                                org_id=str(org_id or "").strip(),
+                                ok=r_org.status_code in {200, 301, 302, 303, 307, 308},
                             )
 
                             # 检查重定向
@@ -2344,23 +2835,36 @@ class OAuthClient:
         return None, None
 
     def _load_workspace_session_data(self, consent_url, user_agent, impersonate):
-        """优先从 cookie 解码 session，失败时回退到 consent HTML 中提取 workspace 数据。"""
-        session_data = self._decode_oauth_session_cookie()
-        if session_data and session_data.get("workspaces"):
-            return session_data
+        """按 provenance 置信度选择 session 数据（cookie 与 consent HTML 交叉校验）。"""
+        cookie_data = self._decode_oauth_session_cookie()
+        cookie_workspace_ids, _ = self._extract_workspace_org_ids_from_session(cookie_data)
+        cookie_score = self._score_session_data_provenance(cookie_data, source="cookie")
 
-        html = self._fetch_consent_page_html(consent_url, user_agent, impersonate)
-        if not html:
-            return session_data
-
-        parsed = self._extract_session_data_from_consent_html(html)
-        if parsed and parsed.get("workspaces"):
+        # 快路径：cookie 信息完整且置信度高时，直接使用，避免额外请求。
+        if cookie_workspace_ids and cookie_score >= 0.85:
             self._log(
-                f"从 consent HTML 提取到 {len(parsed.get('workspaces', []))} 个 workspace"
+                f"session provenance: cookie 高置信直用 (score={cookie_score:.2f}, workspaces={len(cookie_workspace_ids)})"
             )
-            return parsed
+            return self._clean_session_data(cookie_data)
 
-        return session_data
+        html_data = None
+        html = self._fetch_consent_page_html(consent_url, user_agent, impersonate)
+        if html:
+            parsed = self._extract_session_data_from_consent_html(html)
+            if parsed and parsed.get("workspaces"):
+                html_data = parsed
+                self._log(
+                    f"从 consent HTML 提取到 {len(parsed.get('workspaces', []))} 个 workspace"
+                )
+
+        selected, reason = self._select_session_data_with_provenance(
+            cookie_data, html_data
+        )
+        if selected and selected.get("workspaces"):
+            self._log(f"session provenance 选择: {reason}")
+            return selected
+
+        return self._clean_session_data(cookie_data) if cookie_data else None
 
     def _fetch_consent_page_html(self, consent_url, user_agent, impersonate):
         """获取 consent 页 HTML，用于解析 React Router stream 中的 session 数据。"""
@@ -2559,21 +3063,52 @@ class OAuthClient:
             content_type="application/x-www-form-urlencoded",
             fetch_site="same-origin",
         )
+        snapshot_key = "token_exchange"
+        headers = self._capture_headers_once(snapshot_key, headers)
 
         try:
-            kwargs = {"data": payload, "headers": headers, "timeout": 60}
-            if impersonate:
-                kwargs["impersonate"] = impersonate
+            retries_raw = str(
+                self.config.get("oauth_token_exchange_max_retries", "3") or "3"
+            ).strip()
+            try:
+                max_attempts = int(float(retries_raw))
+            except Exception:
+                max_attempts = 3
+            max_attempts = max(1, min(max_attempts, 8))
 
-            self._browser_pause()
-            r = self.session.post(url, **kwargs)
+            attempt_box = {"value": 0}
 
-            if r.status_code == 200:
+            def _request_once():
+                attempt_box["value"] += 1
+                attempt = int(attempt_box["value"])
+                req_headers = self._replay_headers(
+                    snapshot_key,
+                    dynamic_headers=self._trace_headers("token_exchange", attempt),
+                )
+                kwargs = {"data": payload, "headers": req_headers, "timeout": 60}
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+                self._browser_pause()
+                return self.session.post(url, **kwargs)
+
+            replay_result = run_http_step_with_replay(
+                step="token_exchange",
+                request_fn=_request_once,
+                is_success_fn=lambda resp: int(getattr(resp, "status_code", 0) or 0) == 200,
+                max_attempts=max_attempts,
+                log_fn=lambda msg: self._log(msg),
+            )
+            if replay_result.ok and replay_result.response is not None:
+                if replay_result.attempts > 1:
+                    self._log(f"token_exchange 重放成功，尝试次数: {replay_result.attempts}")
                 self._log("token_exchange 成功")
-                return r.json()
-            else:
-                self._set_error(f"换取 tokens 失败: {r.status_code} - {r.text[:200]}")
+                return replay_result.response.json()
 
+            if replay_result.response is not None:
+                r = replay_result.response
+                self._set_error(f"换取 tokens 失败: {r.status_code} - {r.text[:200]}")
+            else:
+                self._set_error(f"换取 tokens 异常: {replay_result.error}")
         except Exception as e:
             self._set_error(f"换取 tokens 异常: {e}")
 
@@ -2592,7 +3127,7 @@ class OAuthClient:
             fetch_site="same-origin",
             extra_headers={"oai-device-id": device_id},
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
         try:
             kwargs = {
@@ -2651,7 +3186,7 @@ class OAuthClient:
             fetch_site="same-origin",
             extra_headers={"oai-device-id": device_id},
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
         try:
             kwargs = {
@@ -2721,7 +3256,7 @@ class OAuthClient:
             fetch_site="same-origin",
             extra_headers={"oai-device-id": device_id},
         )
-        headers.update(generate_datadog_trace())
+        headers.update(self._trace_headers(self.last_stage or "oauth_step"))
 
         try:
             kwargs = {
@@ -2975,7 +3510,7 @@ class OAuthClient:
                         "oai-device-id": device_id,
                     },
                 )
-                headers.update(generate_datadog_trace())
+                headers.update(self._trace_headers(self.last_stage or "oauth_step"))
                 try:
                     kwargs = {"headers": headers, "timeout": 30, "allow_redirects": False}
                     if impersonate:
@@ -3006,7 +3541,7 @@ class OAuthClient:
                     "oai-device-id": device_id,
                 },
             )
-            headers.update(generate_datadog_trace())
+            headers.update(self._trace_headers(self.last_stage or "oauth_step"))
             try:
                 kwargs = {"headers": headers, "timeout": 30, "allow_redirects": True}
                 if impersonate:
@@ -3029,29 +3564,17 @@ class OAuthClient:
             or state.continue_url
             or f"{self.oauth_issuer}/email-verification"
         )
-        sentinel_otp = get_sentinel_token_via_browser(
+        sentinel_otp = self._build_sentinel_token_for_flow(
             flow="email_otp_validate",
-            proxy=self.proxy,
-            page_url=otp_referer,
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            page_url=otp_referer,
+            stage="email_otp_validate",
         )
-        if sentinel_otp:
-            self._log("email_otp_validate: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_otp = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="email_otp_validate",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_otp:
-                self._log("email_otp_validate: 已通过 HTTP PoW 获取 token")
-            else:
-                self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
+        if not sentinel_otp:
+            self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
 
         def _build_otp_headers():
             extra_headers = {
@@ -3070,7 +3593,7 @@ class OAuthClient:
                 fetch_site="same-origin",
                 extra_headers=extra_headers,
             )
-            headers_otp.update(generate_datadog_trace())
+            headers_otp.update(self._trace_headers(self.last_stage or "oauth_step"))
             return headers_otp
 
         if not hasattr(skymail_client, "_used_codes"):

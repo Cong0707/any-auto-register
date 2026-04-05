@@ -164,8 +164,11 @@ class RefreshTokenRegistrationEngine:
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
         self.browser_mode = str(browser_mode or "protocol").strip().lower() or "protocol"
-        # 已移除整流程重试能力，保留参数仅兼容调用方
-        self.max_retries = 1
+        try:
+            retries = int(max_retries)
+        except Exception:
+            retries = 1
+        self.max_retries = max(1, retries)
         self.extra_config = dict(extra_config or {})
 
         self.email: Optional[str] = None
@@ -383,177 +386,210 @@ class RefreshTokenRegistrationEngine:
             minimum=30,
             maximum=3600,
         )
+        max_attempts = max(1, int(self.max_retries or 1))
 
-        try:
+        self._log("=" * 60)
+        self._log("ChatGPT RT 全新主链路启动")
+        self._log(f"请求模式: {self.browser_mode}")
+        self._log("实现策略: 注册状态机 + OAuth 接续流程")
+        self._log(f"最大尝试次数: {max_attempts}")
+        self._log("=" * 60)
+
+        for attempt in range(1, max_attempts + 1):
             registration_message = ""
             source = "register"
+            attempt_tag = f"{attempt}/{max_attempts}"
 
-            self._log("=" * 60)
-            self._log("ChatGPT RT 全新主链路启动")
-            self._log(f"请求模式: {self.browser_mode}")
-            self._log("实现策略: 注册状态机 + OAuth 接续流程")
-            self._log("=" * 60)
+            try:
+                if attempt > 1:
+                    self._log(f"重试第 {attempt} 次（总 {max_attempts} 次）", "warning")
 
-            if not fixed_email:
-                self.email = None
+                if not fixed_email:
+                    self.email = None
+                self.email_info = None
 
-            self._log("1. 创建邮箱...")
-            if not self._create_email():
-                last_error = "创建邮箱失败"
-                result.error_message = last_error
-                return result
-
-            result.email = self.email or ""
-            self.password = self.password or generate_random_password(16)
-            result.password = self.password
-
-            first_name, last_name = generate_random_name()
-            birthdate = generate_random_birthday()
-            self._log(f"邮箱: {result.email}")
-            self._log(f"密码: {self.password}")
-            self._log(f"注册信息: {first_name} {last_name}, 生日: {birthdate}")
-            self._log("流程策略: 注册阶段推进到 about_you 后切换到 OAuth 流程继续完成后续步骤")
-            self._log(
-                "验证码等待策略: "
-                f"register_wait={register_otp_wait_seconds}s, "
-                f"register_resend_wait={register_otp_resend_wait_seconds}s, "
-                "oauth_wait=读取 OAuthClient 配置（默认600s）"
-            )
-
-            email_adapter = EmailServiceAdapter(
-                self.email_service,
-                result.email,
-                self._log,
-            )
-
-            register_client = self._build_chatgpt_client()
-            self._log("2. 执行注册状态机（interrupt 模式：不在注册阶段提交 about_you）...")
-            registered, registration_message = register_client.register_complete_flow(
-                result.email,
-                self.password,
-                first_name,
-                last_name,
-                birthdate,
-                email_adapter,
-                stop_before_about_you_submission=True,
-                otp_wait_timeout=register_otp_wait_seconds,
-                otp_resend_wait_timeout=register_otp_resend_wait_seconds,
-            )
-
-            if not registered:
-                if not self._should_switch_to_login_after_register_failure(
-                    registration_message
-                ):
-                    last_error = f"注册状态机失败: {registration_message}"
+                self._log(f"[尝试 {attempt_tag}] 1. 创建邮箱...")
+                if not self._create_email():
+                    last_error = "创建邮箱失败"
+                    if attempt < max_attempts:
+                        self._log(f"[尝试 {attempt_tag}] {last_error}，准备重试", "warning")
+                        continue
                     result.error_message = last_error
                     return result
 
+                result.email = self.email or ""
+                self.password = generate_random_password(16)
+                result.password = self.password
+
+                first_name, last_name = generate_random_name()
+                birthdate = generate_random_birthday()
+                self._log(f"[尝试 {attempt_tag}] 邮箱: {result.email}")
+                self._log(f"[尝试 {attempt_tag}] 密码: {self.password}")
                 self._log(
-                    "注册阶段命中可继续处理的终态，改走 OAuth 登录流程",
-                    "warning",
+                    f"[尝试 {attempt_tag}] 注册信息: {first_name} {last_name}, 生日: {birthdate}"
                 )
-                self._log(f"切换原因: {registration_message}")
-                source = "login"
-            else:
-                if registration_message == "pending_about_you_submission":
-                    self._log("注册状态机已推进至 about_you，符合预期。下一步进入 OAuth 会话补全资料")
-                else:
+                self._log(
+                    "验证码等待策略: "
+                    f"register_wait={register_otp_wait_seconds}s, "
+                    f"register_resend_wait={register_otp_resend_wait_seconds}s, "
+                    "oauth_wait=读取 OAuthClient 配置（默认600s）"
+                )
+
+                email_adapter = EmailServiceAdapter(
+                    self.email_service,
+                    result.email,
+                    self._log,
+                )
+
+                register_client = self._build_chatgpt_client()
+                self._log(
+                    f"[尝试 {attempt_tag}] 2. 执行注册状态机（interrupt 模式：不在注册阶段提交 about_you）..."
+                )
+                registered, registration_message = register_client.register_complete_flow(
+                    result.email,
+                    self.password,
+                    first_name,
+                    last_name,
+                    birthdate,
+                    email_adapter,
+                    stop_before_about_you_submission=True,
+                    otp_wait_timeout=register_otp_wait_seconds,
+                    otp_resend_wait_timeout=register_otp_resend_wait_seconds,
+                )
+
+                if not registered:
+                    if not self._should_switch_to_login_after_register_failure(
+                        registration_message
+                    ):
+                        last_error = f"注册状态机失败: {registration_message}"
+                        if attempt < max_attempts:
+                            self._log(f"[尝试 {attempt_tag}] {last_error}，准备重试", "warning")
+                            continue
+                        result.error_message = last_error
+                        return result
+
                     self._log(
-                        "注册状态机返回成功但未停在 about_you。"
-                        "将继续进入 OAuth 会话，按状态机实际返回推进。"
+                        "注册阶段命中可继续处理的终态，改走 OAuth 登录流程",
+                        "warning",
+                    )
+                    self._log(f"切换原因: {registration_message}")
+                    source = "login"
+                else:
+                    if registration_message == "pending_about_you_submission":
+                        self._log(
+                            "注册状态机已推进至 about_you，符合预期。下一步进入 OAuth 会话补全资料"
+                        )
+                    else:
+                        self._log(
+                            "注册状态机返回成功但未停在 about_you。"
+                            "将继续进入 OAuth 会话，按状态机实际返回推进。"
+                        )
+
+                oauth_client = self._build_oauth_client()
+                oauth_client.config.setdefault(
+                    "chatgpt_oauth_otp_wait_seconds",
+                    register_otp_wait_seconds,
+                )
+                oauth_client.config.setdefault(
+                    "chatgpt_oauth_otp_resend_wait_seconds",
+                    register_otp_resend_wait_seconds,
+                )
+
+                use_continued_session = registered and (
+                    registration_message == "pending_about_you_submission"
+                )
+
+                if use_continued_session:
+                    self._reuse_register_browser_context(register_client, oauth_client)
+                    self._log("3. 承接前序 session，继续走 OAuth passwordless 流程")
+                    self._log("4. 沿用前序阶段的 cookie / device_id / 浏览器指纹")
+                    self._log("5. 登录成功后提交 about_you，并继续 workspace/token 流程")
+                    tokens = oauth_client.login_and_get_tokens(
+                        result.email,
+                        self.password,
+                        device_id=getattr(register_client, "device_id", "") or "",
+                        user_agent=getattr(register_client, "ua", None),
+                        sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+                        impersonate=getattr(register_client, "impersonate", None),
+                        skymail_client=email_adapter,
+                        prefer_passwordless_login=True,
+                        allow_phone_verification=False,
+                        force_new_browser=False,
+                        force_chatgpt_entry=False,
+                        screen_hint="login",
+                        force_password_login=False,
+                        complete_about_you_if_needed=True,
+                        first_name=first_name,
+                        last_name=last_name,
+                        birthdate=birthdate,
+                        login_source="post_register_workspace_recovery",
+                    )
+                else:
+                    self._log("3. 新开 OAuth session，按 screen_hint=login + passwordless OTP 登录...")
+                    self._log(
+                        "4. 若命中 about_you，则在 OAuth 会话内提交姓名+生日，再继续 workspace/token"
+                    )
+                    tokens = oauth_client.login_and_get_tokens(
+                        result.email,
+                        self.password,
+                        device_id="",
+                        user_agent=getattr(register_client, "ua", None),
+                        sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+                        impersonate=getattr(register_client, "impersonate", None),
+                        skymail_client=email_adapter,
+                        prefer_passwordless_login=True,
+                        allow_phone_verification=False,
+                        force_new_browser=True,
+                        force_chatgpt_entry=False,
+                        screen_hint="login",
+                        force_password_login=False,
+                        complete_about_you_if_needed=True,
+                        first_name=first_name,
+                        last_name=last_name,
+                        birthdate=birthdate,
+                        login_source=(
+                            "existing_account_recovery"
+                            if source == "login"
+                            else "post_register_workspace_recovery"
+                        ),
                     )
 
-            oauth_client = self._build_oauth_client()
-            oauth_client.config.setdefault(
-                "chatgpt_oauth_otp_wait_seconds",
-                register_otp_wait_seconds,
-            )
-            oauth_client.config.setdefault(
-                "chatgpt_oauth_otp_resend_wait_seconds",
-                register_otp_resend_wait_seconds,
-            )
+                if not tokens:
+                    last_error = oauth_client.last_error or "OAuth 登录状态机失败"
+                    if attempt < max_attempts:
+                        self._log(f"[尝试 {attempt_tag}] {last_error}，准备重试", "warning")
+                        continue
+                    result.error_message = last_error
+                    return result
 
-            use_continued_session = registered and (
-                registration_message == "pending_about_you_submission"
-            )
-
-            if use_continued_session:
-                self._reuse_register_browser_context(register_client, oauth_client)
-                self._log("3. 承接前序 session，继续走 OAuth passwordless 流程")
-                self._log("4. 沿用前序阶段的 cookie / device_id / 浏览器指纹")
-                self._log("5. 登录成功后提交 about_you，并继续 workspace/token 流程")
-                tokens = oauth_client.login_and_get_tokens(
-                    result.email,
-                    self.password,
-                    device_id=getattr(register_client, "device_id", "") or "",
-                    user_agent=getattr(register_client, "ua", None),
-                    sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
-                    impersonate=getattr(register_client, "impersonate", None),
-                    skymail_client=email_adapter,
-                    prefer_passwordless_login=True,
-                    allow_phone_verification=False,
-                    force_new_browser=False,
-                    force_chatgpt_entry=False,
-                    screen_hint="login",
-                    force_password_login=False,
-                    complete_about_you_if_needed=True,
-                    first_name=first_name,
-                    last_name=last_name,
-                    birthdate=birthdate,
-                    login_source="post_register_workspace_continue",
-                )
-            else:
-                self._log("3. 新开 OAuth session，按 screen_hint=login + passwordless OTP 登录...")
-                self._log("4. 若命中 about_you，则在 OAuth 会话内提交姓名+生日，再继续 workspace/token")
-                tokens = oauth_client.login_and_get_tokens(
-                    result.email,
-                    self.password,
-                    device_id="",
-                    user_agent=getattr(register_client, "ua", None),
-                    sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
-                    impersonate=getattr(register_client, "impersonate", None),
-                    skymail_client=email_adapter,
-                    prefer_passwordless_login=True,
-                    allow_phone_verification=False,
-                    force_new_browser=True,
-                    force_chatgpt_entry=False,
-                    screen_hint="login",
-                    force_password_login=False,
-                    complete_about_you_if_needed=True,
-                    first_name=first_name,
-                    last_name=last_name,
-                    birthdate=birthdate,
-                    login_source=(
-                        "existing_account_continue" if source == "login" else "post_register_workspace_continue"
-                    ),
+                self._populate_result_from_tokens(
+                    result=result,
+                    tokens=tokens,
+                    oauth_client=oauth_client,
+                    registration_message=registration_message,
+                    source=source,
+                    register_client=register_client,
                 )
 
-            if not tokens:
-                last_error = oauth_client.last_error or "OAuth 登录状态机失败"
+                self._log("5. 主链路完成")
+                self._log(f"Account ID: {result.account_id}")
+                self._log(f"Workspace ID: {result.workspace_id}")
+                self._log("=" * 60)
+                return result
+
+            except TaskInterruption:
+                raise
+            except Exception as e:
+                last_error = str(e)
+                self._log(f"RT 注册主链路异常: {e}", "error")
+                if attempt < max_attempts:
+                    self._log(f"[尝试 {attempt_tag}] 异常后准备重试", "warning")
+                    continue
                 result.error_message = last_error
                 return result
 
-            self._populate_result_from_tokens(
-                result=result,
-                tokens=tokens,
-                oauth_client=oauth_client,
-                registration_message=registration_message,
-                source=source,
-                register_client=register_client,
-            )
-
-            self._log("5. 主链路完成")
-            self._log(f"Account ID: {result.account_id}")
-            self._log(f"Workspace ID: {result.workspace_id}")
-            self._log("=" * 60)
-            return result
-
-        except TaskInterruption:
-            raise
-        except Exception as e:
-            self._log(f"RT 注册主链路异常: {e}", "error")
-            result.error_message = str(e)
-            return result
+        result.error_message = last_error or "注册失败"
+        return result
 
     def save_to_database(self, result: RegistrationResult) -> bool:
         """保留旧接口，占位返回。"""

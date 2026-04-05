@@ -5,9 +5,13 @@ CPA (Codex Protocol API) 上传功能
 import json
 import base64
 import logging
+import os
 from typing import Tuple
 from datetime import datetime, timezone, timedelta
 import hashlib
+import tempfile
+import uuid
+from pathlib import Path
 
 from curl_cffi import requests as cffi_requests
 from curl_cffi import CurlMime
@@ -154,6 +158,80 @@ def _get_config_value(key: str) -> str:
         return ""
 
 
+def _resolve_pending_cpa_upload_dir() -> Path:
+    env_dir = str(os.getenv("CHATGPT_PENDING_CPA_UPLOAD_DIR", "") or "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser()
+
+    cfg_dir = str(_get_config_value("chatgpt_pending_cpa_upload_dir") or "").strip()
+    if cfg_dir:
+        return Path(cfg_dir).expanduser()
+
+    return Path(tempfile.gettempdir()) / "chatgpt_pending_cpa_uploads"
+
+
+def _queue_pending_cpa_upload(
+    token_data: dict,
+    *,
+    api_url: str = "",
+    error_message: str = "",
+    attempts: int = 0,
+    source_file: str = "",
+) -> str:
+    pending_dir = _resolve_pending_cpa_upload_dir()
+    pending_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "last_error": str(error_message or "").strip(),
+        "attempts": int(max(0, attempts)),
+        "api_url": str(api_url or "").strip(),
+        "source_file": str(source_file or "").strip(),
+        "token_data": token_data if isinstance(token_data, dict) else {},
+    }
+    filename = (
+        f"pending_cpa_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:10]}.json"
+    )
+    target_path = pending_dir / filename
+    target_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return str(target_path)
+
+
+def list_pending_cpa_uploads(limit: int = 200) -> list[dict]:
+    pending_dir = _resolve_pending_cpa_upload_dir()
+    if not pending_dir.exists():
+        return []
+
+    files = sorted(pending_dir.glob("pending_cpa_*.json"))
+    if limit > 0:
+        files = files[: int(limit)]
+
+    items: list[dict] = []
+    for path in files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+        except Exception:
+            continue
+        token_data = payload.get("token_data") if isinstance(payload.get("token_data"), dict) else {}
+        items.append(
+            {
+                "file": str(path),
+                "queued_at": str(payload.get("queued_at") or "").strip(),
+                "attempts": int(payload.get("attempts") or 0),
+                "last_error": str(payload.get("last_error") or "").strip(),
+                "api_url": str(payload.get("api_url") or "").strip(),
+                "email": str(token_data.get("email") or "").strip(),
+            }
+        )
+    return items
+
+
 def generate_token_json(account) -> dict:
     """
     生成 CPA 格式的 Token JSON。
@@ -192,24 +270,19 @@ def generate_token_json(account) -> dict:
     }
 
 
-def upload_to_cpa(
+def _upload_to_cpa_once(
     token_data: dict,
-    api_url: str = None,
-    api_key: str = None,
-    proxy: str = None,
+    *,
+    api_url: str,
+    api_key: str,
 ) -> Tuple[bool, str]:
-    """上传单个账号到 CPA 管理平台（不走代理）。
-    api_url / api_key 为空时自动从 ConfigStore 读取。"""
-    if not api_url:
-        api_url = _get_config_value("cpa_api_url")
-    if not api_key:
-        api_key = _get_config_value("cpa_api_key")
     if not api_url:
         return False, "CPA API URL 未配置"
 
     upload_url = f"{api_url.rstrip('/')}/v0/management/auth-files"
 
-    filename = f"{token_data['email']}.json"
+    email = str(token_data.get("email") or "unknown").strip() or "unknown"
+    filename = f"{email}.json"
     file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
 
     headers = {
@@ -254,6 +327,127 @@ def upload_to_cpa(
     finally:
         if mime:
             mime.close()
+
+
+def upload_to_cpa(
+    token_data: dict,
+    api_url: str = None,
+    api_key: str = None,
+    proxy: str = None,
+    queue_on_fail: bool = True,
+) -> Tuple[bool, str]:
+    """上传单个账号到 CPA 管理平台（不走代理）。
+    api_url / api_key 为空时自动从 ConfigStore 读取。"""
+    if not api_url:
+        api_url = _get_config_value("cpa_api_url")
+    if not api_key:
+        api_key = _get_config_value("cpa_api_key")
+
+    ok, msg = _upload_to_cpa_once(
+        token_data,
+        api_url=api_url,
+        api_key=api_key,
+    )
+    if ok:
+        return ok, msg
+
+    if queue_on_fail:
+        try:
+            pending_file = _queue_pending_cpa_upload(
+                token_data,
+                api_url=api_url or "",
+                error_message=msg,
+            )
+            msg = f"{msg}；已加入待重传队列: {pending_file}"
+        except Exception as exc:
+            logger.warning("写入待重传队列失败: %s", exc)
+    return ok, msg
+
+
+def retry_pending_cpa_uploads(
+    *,
+    api_url: str | None = None,
+    api_key: str | None = None,
+    max_items: int = 100,
+    stop_on_error: bool = False,
+) -> dict:
+    pending_dir = _resolve_pending_cpa_upload_dir()
+    files = sorted(pending_dir.glob("pending_cpa_*.json")) if pending_dir.exists() else []
+    if max_items > 0:
+        files = files[: int(max_items)]
+
+    summary = {
+        "pending_dir": str(pending_dir),
+        "total": len(files),
+        "retried": 0,
+        "success": 0,
+        "failed": 0,
+        "remaining": 0,
+        "items": [],
+    }
+
+    if not api_url:
+        api_url = _get_config_value("cpa_api_url")
+    if not api_key:
+        api_key = _get_config_value("cpa_api_key")
+
+    for path in files:
+        summary["retried"] += 1
+        detail = {
+            "file": str(path),
+            "email": "",
+            "ok": False,
+            "message": "",
+        }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("文件 JSON 结构不是 object")
+        except Exception as exc:
+            detail["message"] = f"读取失败: {exc}"
+            summary["failed"] += 1
+            summary["items"].append(detail)
+            if stop_on_error:
+                break
+            continue
+
+        token_data = payload.get("token_data") if isinstance(payload.get("token_data"), dict) else {}
+        detail["email"] = str(token_data.get("email") or "").strip()
+        target_api_url = str(api_url or payload.get("api_url") or "").strip()
+
+        ok, msg = _upload_to_cpa_once(
+            token_data,
+            api_url=target_api_url,
+            api_key=api_key or "",
+        )
+        detail["ok"] = bool(ok)
+        detail["message"] = msg
+        summary["items"].append(detail)
+
+        if ok:
+            summary["success"] += 1
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+
+        summary["failed"] += 1
+        payload["attempts"] = int(payload.get("attempts") or 0) + 1
+        payload["last_error"] = msg
+        payload["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        if stop_on_error:
+            break
+
+    summary["remaining"] = len(sorted(pending_dir.glob("pending_cpa_*.json"))) if pending_dir.exists() else 0
+    return summary
 
 
 def upload_to_team_manager(

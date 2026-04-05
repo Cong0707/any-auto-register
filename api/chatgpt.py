@@ -84,6 +84,37 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
     raise HTTPException(400, result.error_message)
 
 
+class RefreshTokenDirReq(BaseModel):
+    token_dir: str = ""
+    recursive: bool = False
+    proxy: Optional[str] = None
+    dry_run: bool = False
+    backup: bool = True
+    fail_fast: bool = False
+
+
+@router.post("/refresh-token-dir")
+def refresh_token_dir(req: RefreshTokenDirReq):
+    from platforms.chatgpt.token_json_refresh import (
+        refresh_token_json_directory,
+        resolve_default_token_dir,
+    )
+
+    token_dir = (req.token_dir or "").strip() or str(resolve_default_token_dir())
+    try:
+        summary = refresh_token_json_directory(
+            token_dir,
+            recursive=bool(req.recursive),
+            proxy_url=(req.proxy or "").strip() or None,
+            dry_run=bool(req.dry_run),
+            backup=bool(req.backup),
+            fail_fast=bool(req.fail_fast),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return summary.to_dict()
+
+
 # ── 生成支付链接 ────────────────────────────────────────────
 class PaymentReq(BaseModel):
     plan: str = "plus"  # plus | team
@@ -159,6 +190,41 @@ def upload_cpa(account_id: int, req: CpaUploadReq,
     token_data = generate_token_json(codex_acc)
     ok, msg = upload_to_cpa(token_data, api_url=req.api_url, api_key=req.api_key)
     return {"ok": ok, "message": msg}
+
+
+class PendingCpaRetryReq(BaseModel):
+    api_url: str = ""
+    api_key: str = ""
+    max_items: int = 100
+    stop_on_error: bool = False
+
+
+@router.get("/pending-cpa-uploads")
+def list_pending_cpa_uploads(limit: int = 200):
+    from platforms.chatgpt.cpa_upload import list_pending_cpa_uploads as _list_pending
+
+    limit = max(1, min(int(limit or 200), 1000))
+    items = _list_pending(limit=limit)
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+
+
+@router.post("/retry-pending-cpa-uploads")
+def retry_pending_cpa_uploads(req: PendingCpaRetryReq):
+    from platforms.chatgpt.cpa_upload import retry_pending_cpa_uploads as _retry_pending
+
+    max_items = max(1, min(int(req.max_items or 100), 1000))
+    result = _retry_pending(
+        api_url=(req.api_url or "").strip() or None,
+        api_key=(req.api_key or "").strip() or None,
+        max_items=max_items,
+        stop_on_error=bool(req.stop_on_error),
+    )
+    result["ok"] = result.get("failed", 0) == 0
+    return result
 
 
 class Sub2ApiUploadReq(BaseModel):

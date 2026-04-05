@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Callable, Optional
 
 from core.browser_runtime import (
@@ -24,6 +25,44 @@ def _flow_page_url(flow: str) -> str:
     return mapping.get(flow_name, "https://auth.openai.com/about-you")
 
 
+def _apply_env_overrides(
+    *,
+    flow: str,
+    proxy: Optional[str],
+    timeout_ms: int,
+    page_url: Optional[str],
+    user_agent: Optional[str],
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> tuple[str, Optional[str], int, str, Optional[str]]:
+    logger = log_fn or (lambda _msg: None)
+
+    env_flow = str(os.getenv("SENTINEL_BROWSER_FLOW", "") or "").strip()
+    if env_flow:
+        flow = env_flow
+
+    env_proxy = str(os.getenv("SENTINEL_BROWSER_PROXY", "") or "").strip()
+    if env_proxy:
+        proxy = env_proxy
+
+    env_page_url = str(os.getenv("SENTINEL_BROWSER_PAGE_URL", "") or "").strip()
+    target_url = env_page_url or str(page_url or _flow_page_url(flow)).strip() or _flow_page_url(flow)
+
+    env_timeout_ms = str(os.getenv("SENTINEL_BROWSER_TIMEOUT_MS", "") or "").strip()
+    if env_timeout_ms:
+        try:
+            parsed_timeout = int(env_timeout_ms)
+            if parsed_timeout > 0:
+                timeout_ms = parsed_timeout
+        except ValueError:
+            logger(f"SENTINEL_BROWSER_TIMEOUT_MS 非法，忽略: {env_timeout_ms}")
+
+    env_ua = str(os.getenv("SENTINEL_BROWSER_UA", "") or "").strip()
+    if env_ua:
+        user_agent = env_ua
+
+    return flow, proxy, timeout_ms, target_url, user_agent
+
+
 def get_sentinel_token_via_browser(
     *,
     flow: str,
@@ -32,6 +71,7 @@ def get_sentinel_token_via_browser(
     page_url: Optional[str] = None,
     headless: bool = True,
     device_id: Optional[str] = None,
+    user_agent: Optional[str] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
@@ -43,7 +83,21 @@ def get_sentinel_token_via_browser(
         logger(f"Sentinel Browser 不可用: {e}")
         return None
 
-    target_url = str(page_url or _flow_page_url(flow)).strip() or _flow_page_url(flow)
+    flow, proxy, timeout_ms, target_url, user_agent = _apply_env_overrides(
+        flow=flow,
+        proxy=proxy,
+        timeout_ms=timeout_ms,
+        page_url=page_url,
+        user_agent=user_agent,
+        log_fn=logger,
+    )
+
+    effective_user_agent = user_agent or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.7103.92 Safari/537.36"
+    )
+
     effective_headless, reason = resolve_browser_headless(headless)
     ensure_browser_display_available(effective_headless)
     logger(
@@ -61,18 +115,18 @@ def get_sentinel_token_via_browser(
     if proxy_config:
         launch_args["proxy"] = proxy_config
 
-    logger(f"Sentinel Browser 启动: flow={flow}, url={target_url}")
+    logger(
+        "Sentinel Browser 启动: "
+        f"flow={flow}, url={target_url}, timeout_ms={timeout_ms}, "
+        f"proxy={'on' if proxy else 'off'}"
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch_args)
         try:
             context = browser.new_context(
                 viewport={"width": 1440, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/136.0.7103.92 Safari/537.36"
-                ),
+                user_agent=effective_user_agent,
                 ignore_https_errors=True,
             )
             if device_id:
