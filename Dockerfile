@@ -38,13 +38,19 @@ COPY scripts/install_camoufox.py /tmp/install_camoufox.py
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates \
         libgtk-3-0 libx11-xcb1 libasound2 xvfb xauth \
-    && curl -fsSL https://go.dev/dl/go1.24.2.linux-amd64.tar.gz | tar -C /usr/local -xz \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && if ! (curl -fsSL https://go.dev/dl/go1.24.2.linux-amd64.tar.gz | tar -C /usr/local -xz); then \
+         echo "primary Go install failed, falling back to apt package" >&2; \
+         apt-get update && apt-get install -y --no-install-recommends golang-go; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PATH="/usr/local/go/bin:/root/.local/bin:${PATH}"
+ENV PATH="/usr/local/go/bin:/root/.local/bin:/usr/local/bin:${PATH}"
 
 RUN pip install --upgrade pip \
+    && if ! (curl -LsSf https://astral.sh/uv/install.sh | sh); then \
+         echo "primary uv install failed, falling back to pip install uv" >&2; \
+         pip install uv; \
+       fi \
     && pip install -r requirements.txt \
     && installed=0 \
     && for attempt in 1 2 3; do \
