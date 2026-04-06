@@ -14,6 +14,7 @@ smstome_tool_stub.wait_for_otp = lambda *args, **kwargs: None
 sys.modules.setdefault("smstome_tool", smstome_tool_stub)
 
 from platforms.chatgpt.oauth_client import OAuthClient
+from platforms.chatgpt.chatgpt_client import ChatGPTClient
 from platforms.chatgpt.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
 )
@@ -218,6 +219,79 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         call_args = register_client.register_complete_flow.call_args_list
         self.assertEqual(call_args[0].args[0], "user1@example.com")
         self.assertEqual(len(call_args), 1)
+
+
+class ChatGPTClientRegistrationOtpResendTests(unittest.TestCase):
+    def _make_client(self):
+        client = ChatGPTClient(proxy="http://127.0.0.1:7890", verbose=False)
+        client._log = lambda *_args, **_kwargs: None
+        return client
+
+    def test_register_complete_flow_resends_email_otp_after_chunk_timeout(self):
+        client = self._make_client()
+        clock = {"now": 1000.0}
+        wait_calls = []
+
+        about_you_state = FlowState(
+            page_type="about_you",
+            continue_url="https://auth.openai.com/about-you",
+            current_url="https://auth.openai.com/about-you",
+        )
+
+        def fake_time():
+            return clock["now"]
+
+        def fake_wait_for_verification_code(
+            email,
+            timeout,
+            otp_sent_at=None,
+            exclude_codes=None,
+        ):
+            wait_calls.append(
+                {
+                    "email": email,
+                    "timeout": timeout,
+                    "otp_sent_at": otp_sent_at,
+                    "exclude_codes": set(exclude_codes or set()),
+                }
+            )
+            clock["now"] += float(timeout) + 1
+            if len(wait_calls) == 1:
+                raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+            return "285546"
+
+        skymail_client = mock.Mock()
+        skymail_client._used_codes = set()
+        skymail_client.wait_for_verification_code.side_effect = fake_wait_for_verification_code
+
+        with mock.patch("platforms.chatgpt.chatgpt_client.time.time", side_effect=fake_time), \
+            mock.patch.object(client, "visit_homepage", return_value=True), \
+            mock.patch.object(client, "get_csrf_token", return_value="csrf-token"), \
+            mock.patch.object(client, "signin", return_value="https://auth.openai.com/authorize"), \
+            mock.patch.object(client, "authorize", return_value="https://auth.openai.com/create-account/password"), \
+            mock.patch.object(client, "register_user", return_value=(True, "注册成功")), \
+            mock.patch.object(client, "send_email_otp", side_effect=[True, True]) as send_otp, \
+            mock.patch.object(client, "verify_email_otp", return_value=(True, about_you_state)):
+            success, message = client.register_complete_flow(
+                "user@example.com",
+                "Secret123!",
+                "Ada",
+                "Stone",
+                "1990-01-02",
+                skymail_client,
+                stop_before_about_you_submission=True,
+                otp_wait_timeout=90,
+                otp_resend_wait_timeout=30,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(message, "pending_about_you_submission")
+        self.assertEqual(send_otp.call_count, 2)
+        self.assertEqual(len(wait_calls), 2)
+        self.assertEqual(wait_calls[0]["timeout"], 30)
+        self.assertEqual(wait_calls[1]["timeout"], 30)
+        self.assertEqual(wait_calls[0]["otp_sent_at"], 1000.0)
+        self.assertGreater(wait_calls[1]["otp_sent_at"], wait_calls[0]["otp_sent_at"])
 
 
 class OAuthClientPasswordlessTests(unittest.TestCase):

@@ -755,6 +755,90 @@ class ChatGPTClient:
             self._log(f"验证异常: {e}")
             return False, str(e)
 
+    def _wait_for_registration_email_otp(
+        self,
+        email,
+        state,
+        skymail_client,
+        *,
+        otp_wait_timeout,
+        otp_resend_wait_timeout,
+        otp_sent_at,
+        otp_send_attempts,
+    ):
+        if not hasattr(skymail_client, "wait_for_verification_code"):
+            return "", otp_send_attempts
+
+        if not hasattr(skymail_client, "_used_codes"):
+            skymail_client._used_codes = set()
+
+        tried_codes = set(getattr(skymail_client, "_used_codes", set()))
+        otp_deadline = time.time() + otp_wait_timeout
+        otp_sent_at = float(otp_sent_at or time.time())
+        next_resend_at = min(otp_deadline, otp_sent_at + otp_resend_wait_timeout)
+        otp_poll_window = max(10, min(30, otp_resend_wait_timeout, otp_wait_timeout))
+        referer = (
+            state.current_url
+            or state.continue_url
+            or f"{self.AUTH}/email-verification"
+        )
+
+        self._log(
+            f"进入收码阶段，总等待时间 {otp_wait_timeout}s, "
+            f"每 {otp_resend_wait_timeout}s 自动重试发送..."
+        )
+
+        while time.time() < otp_deadline:
+            now = time.time()
+            remaining = max(1, int(otp_deadline - now))
+            wait_time = min(otp_poll_window, remaining)
+            if next_resend_at > now:
+                wait_time = min(wait_time, max(1, int(next_resend_at - now)))
+
+            try:
+                code = skymail_client.wait_for_verification_code(
+                    email,
+                    timeout=wait_time,
+                    otp_sent_at=otp_sent_at,
+                    exclude_codes=tried_codes,
+                )
+            except TypeError:
+                code = skymail_client.wait_for_verification_code(
+                    email,
+                    timeout=wait_time,
+                )
+            except Exception as e:
+                if "手动停止" in str(e):
+                    raise
+                if "等待验证码超时" not in str(e):
+                    self._log(f"等待验证码异常: {e}")
+                code = None
+
+            code = str(code or "").strip()
+            if code:
+                return code, otp_send_attempts
+
+            now = time.time()
+            if now >= next_resend_at:
+                elapsed = int(otp_wait_timeout - max(0, otp_deadline - now))
+                self._log(
+                    f"已等待 {elapsed}s 未收到可用验证码，尝试重发 (Resend OTP)..."
+                )
+                otp_send_attempts += 1
+                resend_requested_at = time.time()
+                resend_ok = self.send_email_otp(referer=referer)
+                if resend_ok:
+                    otp_sent_at = resend_requested_at
+                    self._log(f"重发验证码成功: attempt={otp_send_attempts}")
+                else:
+                    self._log(f"重发验证码失败: attempt={otp_send_attempts}")
+                next_resend_at = min(
+                    otp_deadline,
+                    time.time() + otp_resend_wait_timeout,
+                )
+
+        return "", otp_send_attempts
+
     def create_account(self, first_name, last_name, birthdate, return_state=False):
         """
         完成账号创建（提交姓名和生日）
@@ -940,6 +1024,7 @@ class ChatGPTClient:
         seen_states = {}
 
         otp_send_attempts = 0
+        otp_sent_at = None
 
         for _ in range(12):
             signature = self._state_signature(state)
@@ -965,6 +1050,7 @@ class ChatGPTClient:
                     return False, f"注册失败: {msg}"
                 register_submitted = True
                 otp_send_attempts += 1
+                otp_sent_at = time.time()
                 self._log(f"发送注册验证码: attempt={otp_send_attempts}")
                 if not self.send_email_otp(
                     referer=state.current_url or state.continue_url or f"{self.AUTH}/create-account/password"
@@ -977,25 +1063,15 @@ class ChatGPTClient:
 
             if self._state_is_email_otp(state):
                 self._log("等待邮箱验证码...")
-                otp_code = skymail_client.wait_for_verification_code(
-                    email, timeout=otp_wait_timeout
+                otp_code, otp_send_attempts = self._wait_for_registration_email_otp(
+                    email,
+                    state,
+                    skymail_client,
+                    otp_wait_timeout=otp_wait_timeout,
+                    otp_resend_wait_timeout=otp_resend_wait_timeout,
+                    otp_sent_at=otp_sent_at,
+                    otp_send_attempts=otp_send_attempts,
                 )
-                if not otp_code:
-                    self._log(
-                        "首次等待未收到验证码，尝试重发一次 email-otp/send "
-                        f"后再等待 {otp_resend_wait_timeout}s"
-                    )
-                    otp_send_attempts += 1
-                    resend_ok = self.send_email_otp(
-                        referer=state.current_url or state.continue_url or f"{self.AUTH}/email-verification"
-                    )
-                    if resend_ok:
-                        self._log(f"重发验证码成功: attempt={otp_send_attempts}")
-                    else:
-                        self._log(f"重发验证码失败: attempt={otp_send_attempts}")
-                    otp_code = skymail_client.wait_for_verification_code(
-                        email, timeout=otp_resend_wait_timeout
-                    )
                 if not otp_code:
                     return False, "未收到验证码"
 
