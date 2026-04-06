@@ -100,6 +100,14 @@ def _now_string() -> str:
     return datetime.now(tz=_CST).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
+def _normalize_token_dir_candidate(text: str) -> str:
+    normalized = str(text or "").strip()
+    if len(normalized) >= 3 and normalized[1:3] == ":\\":
+        while "\\\\" in normalized:
+            normalized = normalized.replace("\\\\", "\\")
+    return normalized
+
+
 def _iter_token_json_files(root: Path, recursive: bool) -> Iterable[Path]:
     pattern = "**/*.json" if recursive else "*.json"
     for path in sorted(root.glob(pattern)):
@@ -209,7 +217,7 @@ def resolve_default_token_dir() -> Path:
         pass
 
     for item in [*env_candidates, *config_candidates]:
-        text = str(item or "").strip()
+        text = _normalize_token_dir_candidate(str(item or ""))
         if text:
             return Path(text).expanduser()
 
