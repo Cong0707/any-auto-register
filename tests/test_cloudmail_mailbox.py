@@ -77,6 +77,41 @@ class CloudMailMailboxTests(unittest.TestCase):
         self.assertEqual(code, "654321")
         self.assertEqual(mock_post.call_count, 4)
 
+    @mock.patch("requests.post")
+    def test_wait_for_code_allows_small_timestamp_skew_after_otp_resend(self, mock_post):
+        mock_post.side_effect = [
+            _json_response({"code": 200, "data": {"token": "tok-1"}}),
+            _json_response(
+                {
+                    "code": 200,
+                    "data": [
+                        {
+                            "emailId": "m-2",
+                            "toEmail": "demo@example.com",
+                            "subject": "Your verification code is 777888",
+                            "content": "",
+                            "time": 998.5,
+                        }
+                    ],
+                }
+            ),
+        ]
+
+        mailbox = create_mailbox(
+            "cloudmail",
+            extra={
+                "cloudmail_api_base": "https://cloudmail.example.com",
+                "cloudmail_admin_email": "admin@example.com",
+                "cloudmail_admin_password": "secret",
+                "cloudmail_domain": "mail.example.com",
+            },
+        )
+        account = MailboxAccount(email="demo@example.com", account_id="demo@example.com")
+
+        code = mailbox.wait_for_code(account, timeout=5, otp_sent_at=1000)
+
+        self.assertEqual(code, "777888")
+
 
 def _json_response(payload: dict, status_code: int = 200):
     response = mock.Mock()

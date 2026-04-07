@@ -20,12 +20,19 @@ services:
       SOLVER_BIND_HOST: 0.0.0.0
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
+      SOLVER_THREAD_COUNT: "${SOLVER_THREAD_COUNT:-1}"
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
+      CLIPROXYAPI_UPSTREAM_HOST: ${CLIPROXYAPI_UPSTREAM_HOST:-host.docker.internal}
+      CLIPROXYAPI_UPSTREAM_PORT: "${CLIPROXYAPI_UPSTREAM_PORT:-8317}"
+      GROK2API_UPSTREAM_HOST: ${GROK2API_UPSTREAM_HOST:-host.docker.internal}
+      GROK2API_UPSTREAM_PORT: "${GROK2API_UPSTREAM_PORT:-8011}"
     ports:
       - "8000:8000"
       - "127.0.0.1:8889:8889"
       - "${CLIPROXYAPI_PORT_BIND:-8317}:8317"
       - "${GROK2API_PORT_BIND:-8011}:8011"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ${APP_RUNTIME_BIND:-./data}:/runtime
       - ${APP_EXT_TARGETS_BIND:-./_ext_targets}:/_ext_targets

@@ -1516,6 +1516,7 @@ class CloudMailMailbox(BaseMailbox):
         seen = set(before_ids or set())
         seen.update(self._load_seen_ids(target))
         otp_sent_at = kwargs.get("otp_sent_at")
+        otp_cutoff = float(otp_sent_at) - 2 if otp_sent_at else None
         exclude_codes = {
             str(code).strip()
             for code in (kwargs.get("exclude_codes") or set())
@@ -1533,7 +1534,7 @@ class CloudMailMailbox(BaseMailbox):
                     self._remember_seen_id(target, mid)
 
                     msg_ts = self._parse_message_timestamp(msg)
-                    if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
+                    if otp_cutoff and msg_ts and msg_ts < otp_cutoff:
                         continue
 
                     content = " ".join(

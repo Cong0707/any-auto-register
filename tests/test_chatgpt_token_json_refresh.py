@@ -132,6 +132,11 @@ class TokenJSONRefreshTests(unittest.TestCase):
             resolved = resolve_default_token_dir()
         self.assertEqual(str(resolved), r"D:\tokens")
 
+    def test_resolve_default_token_dir_normalizes_escaped_windows_env_path(self):
+        with patch.dict("os.environ", {"TOKEN_JSON_DIR": r"D:\\\\tokens\\\\nested"}, clear=False):
+            resolved = resolve_default_token_dir()
+        self.assertEqual(str(resolved), r"D:\tokens\nested")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -330,6 +330,7 @@ services/turnstile_solver/solver.log
 - 已构建的前端静态资源
 - SQLite 数据库持久化目录 `./data`
 - 随后端自动拉起的本地 Turnstile Solver
+- 容器内 `8317/8011` 到宿主 `CLIProxyAPI/grok2api` 的可选端口桥接
 
 ### 启动
 
@@ -340,6 +341,12 @@ docker compose up -d --build
 首次构建会额外下载 Python 依赖、Playwright Chromium 和 Camoufox，因此耗时会明显更长。
 
 当前 Dockerfile 已改为通过固定直链安装 Camoufox，以避免构建时访问 GitHub Releases API 触发匿名限流。
+
+当前 Compose 默认还会注入：
+
+- `host.docker.internal:host-gateway`
+
+用于让容器内新增的桥接进程稳定访问宿主机上的 `CLIProxyAPI` / `grok2api`。
 
 ### 访问
 
@@ -383,8 +390,23 @@ DATABASE_URL=sqlite:////app/data/account_manager.db
 | `APP_ENABLE_SOLVER` | `1` | 是否自动启动本地 Solver，设为 `0` 可禁用 |
 | `SOLVER_PORT` | `8889` | Solver 监听端口 |
 | `LOCAL_SOLVER_URL` | `http://127.0.0.1:8889` | 后端访问 Solver 的地址 |
+| `SOLVER_THREAD_COUNT` | `1` | Solver 浏览器线程数 |
+| `CLIPROXYAPI_PORT_BIND` | `8317` | 宿主机映射到容器内 `8317` 的端口 |
+| `GROK2API_PORT_BIND` | `8011` | 宿主机映射到容器内 `8011` 的端口 |
+| `CLIPROXYAPI_UPSTREAM_HOST` | `host.docker.internal` | 容器内桥接进程访问宿主 `CLIProxyAPI` 的主机名 |
+| `CLIPROXYAPI_UPSTREAM_PORT` | `8317` | 容器内桥接进程访问宿主 `CLIProxyAPI` 的端口 |
+| `GROK2API_UPSTREAM_HOST` | `host.docker.internal` | 容器内桥接进程访问宿主 `grok2api` 的主机名 |
+| `GROK2API_UPSTREAM_PORT` | `8011` | 容器内桥接进程访问宿主 `grok2api` 的端口 |
 
 如需传入 `SMSTOME_COOKIE`、`OPENAI_*` 等配置，可直接写入仓库根目录 `.env` 文件，`docker compose` 会自动注入到容器环境中。
+
+如果你宿主机上已经单独运行了 `CLIProxyAPI`，且不想占用宿主 `8317`，可以在 `.env` 中显式指定：
+
+```env
+CLIPROXYAPI_PORT_BIND=18317
+```
+
+这样宿主访问入口会变成 `http://127.0.0.1:18317`，容器内应用仍继续使用 `127.0.0.1:8317`，由桥接进程转发到宿主实际服务。
 
 ### Camoufox 构建参数
 
@@ -398,6 +420,8 @@ CAMOUFOX_VERSION=135.0.1 CAMOUFOX_RELEASE=beta.24 docker compose build app
 
 - 当前 Docker 镜像主要覆盖主应用和本地 Turnstile Solver
 - `grok2api`、`CLIProxyAPI`、`Kiro Account Manager` 的自动安装/拉起逻辑仍偏向宿主机环境
+- 当容器内应用仍按 `127.0.0.1:8317` / `127.0.0.1:8011` 访问外部服务时，Compose 会启动一个轻量 TCP 桥接进程，把请求转发到宿主机对应端口
+- 桥接日志位于 `./data/logs/port-bridge.log`
 - 若依赖 `conda`、Go 或 Windows 可执行文件，不建议直接在当前 Linux 容器中启动这些插件
 - 如果你只需要 Web UI、账号管理、任务调度和本地 Solver，当前 Compose 配置可直接使用
 

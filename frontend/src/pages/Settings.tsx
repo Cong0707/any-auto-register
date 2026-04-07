@@ -240,6 +240,18 @@ const TAB_ITEMS = [
         ],
       },
       {
+        title: '邮箱验证码等待',
+        desc: '控制 ChatGPT 注册阶段和 OAuth 阶段的 OTP 总等待时间与自动重发间隔',
+        fields: [
+          { key: 'chatgpt_register_otp_wait_seconds', label: '注册阶段总等待秒数', placeholder: '600' },
+          { key: 'chatgpt_register_otp_resend_wait_seconds', label: '注册阶段重发间隔秒数', placeholder: '90 / 120 / 300' },
+          { key: 'chatgpt_oauth_otp_wait_seconds', label: 'OAuth 阶段总等待秒数', placeholder: '600' },
+          { key: 'chatgpt_oauth_otp_resend_wait_seconds', label: 'OAuth 阶段重发间隔秒数', placeholder: '45 / 90 / 120' },
+          { key: 'chatgpt_otp_wait_seconds', label: '通用等待秒数（兜底）', placeholder: '留空则分别使用阶段配置' },
+          { key: 'chatgpt_otp_resend_wait_seconds', label: '通用重发间隔秒数（兜底）', placeholder: '留空则分别使用阶段配置' },
+        ],
+      },
+      {
         title: 'Sub2API 面板',
         desc: '注册完成后自动上传到 Sub2API 管理后台',
         fields: [

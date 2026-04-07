@@ -106,6 +106,9 @@ class TurnstileAPIServer:
         self.browser_args = []
         if self.useragent:
             self.browser_args.append(f"--user-agent={self.useragent}")
+        self.browser_init_task: Optional[asyncio.Task] = None
+        self.browser_init_error: Optional[str] = None
+        self.browser_init_done = asyncio.Event()
 
         self._setup_routes()
 
@@ -152,16 +155,19 @@ class TurnstileAPIServer:
         """Initialize the browser and page pool on startup."""
         self.display_welcome()
         logger.info("Starting browser initialization")
+        await init_db()
+        self.browser_init_task = asyncio.create_task(self._initialize_browser_background())
+        asyncio.create_task(self._periodic_cleanup())
+
+    async def _initialize_browser_background(self) -> None:
         try:
-            await init_db()
             await self._initialize_browser()
-            
-            # Запускаем периодическую очистку старых результатов
-            asyncio.create_task(self._periodic_cleanup())
-            
+            self.browser_init_error = None
         except Exception as e:
+            self.browser_init_error = str(e)
             logger.error(f"Failed to initialize browser: {str(e)}")
-            raise
+        finally:
+            self.browser_init_done.set()
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
@@ -237,8 +243,11 @@ class TurnstileAPIServer:
             if browser:
                 await self.browser_pool.put((i+1, browser, config))
 
-            if self.debug:
-                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+        if self.browser_pool.qsize() <= 0:
+            raise RuntimeError("浏览器池初始化失败，未创建可用浏览器实例")
+
+        if self.debug:
+            logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
 
         logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
         
@@ -955,6 +964,20 @@ class TurnstileAPIServer:
         action = request.args.get('action')
         cdata = request.args.get('cdata')
 
+        if self.browser_init_error:
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_SOLVER_INIT_FAILED",
+                "errorDescription": self.browser_init_error
+            }), 200
+
+        if self.browser_pool.qsize() <= 0:
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_SOLVER_NOT_READY",
+                "errorDescription": "Solver 正在初始化浏览器，请稍后重试"
+            }), 200
+
         if not url or not sitekey:
             return jsonify({
                 "errorId": 1,
@@ -1099,7 +1122,7 @@ def parse_args():
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
     parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=4, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
+    parser.add_argument('--thread', type=int, default=int(os.getenv('SOLVER_THREAD_COUNT', '1')), help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
