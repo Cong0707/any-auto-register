@@ -13,6 +13,8 @@ RUN npm run build
 
 FROM python:3.12-slim AS runtime
 
+ARG GO_VERSION=1.24.2
+ARG UV_VERSION=0.6.14
 ARG CAMOUFOX_VERSION=135.0.1
 ARG CAMOUFOX_RELEASE=beta.24
 
@@ -38,9 +40,12 @@ COPY scripts/install_camoufox.py /tmp/install_camoufox.py
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates \
         libgtk-3-0 libx11-xcb1 libasound2 xvfb xauth \
-    && if ! (curl -fsSL https://go.dev/dl/go1.24.2.linux-amd64.tar.gz | tar -C /usr/local -xz); then \
-         echo "primary Go install failed, falling back to apt package" >&2; \
-         apt-get update && apt-get install -y --no-install-recommends golang-go; \
+    && if ! (curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz); then \
+         echo "primary Go install failed, retrying alternate mirror" >&2; \
+         if ! (curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz); then \
+           echo "alternate Go mirror failed, falling back to apt package" >&2; \
+           apt-get update && apt-get install -y --no-install-recommends golang-go; \
+         fi; \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
@@ -48,8 +53,8 @@ ENV PATH="/usr/local/go/bin:/root/.local/bin:/usr/local/bin:${PATH}"
 
 RUN pip install --upgrade pip \
     && if ! (curl -LsSf https://astral.sh/uv/install.sh | sh); then \
-         echo "primary uv install failed, falling back to pip install uv" >&2; \
-         pip install uv; \
+         echo "primary uv install failed, falling back to pinned pip install uv==${UV_VERSION}" >&2; \
+         pip install "uv==${UV_VERSION}"; \
        fi \
     && pip install -r requirements.txt \
     && installed=0 \
