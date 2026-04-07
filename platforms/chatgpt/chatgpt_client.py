@@ -6,6 +6,7 @@ ChatGPT 注册客户端模块
 import random
 import uuid
 import time
+import inspect
 from urllib.parse import urlparse
 from core.proxy_utils import build_requests_proxy_config
 
@@ -755,6 +756,23 @@ class ChatGPTClient:
             self._log(f"验证异常: {e}")
             return False, str(e)
 
+    @staticmethod
+    def _mailbox_wait_supports_filters(skymail_client) -> bool:
+        wait_fn = getattr(skymail_client, "wait_for_verification_code", None)
+        if not callable(wait_fn):
+            return False
+        try:
+            signature = inspect.signature(wait_fn)
+        except (TypeError, ValueError):
+            return False
+
+        parameters = signature.parameters.values()
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+            return True
+
+        supported = set(signature.parameters.keys())
+        return {"otp_sent_at", "exclude_codes"}.issubset(supported)
+
     def _wait_for_registration_email_otp(
         self,
         email,
@@ -766,13 +784,15 @@ class ChatGPTClient:
         otp_sent_at,
         otp_send_attempts,
     ):
-        if not hasattr(skymail_client, "wait_for_verification_code"):
+        wait_fn = getattr(skymail_client, "wait_for_verification_code", None)
+        if not callable(wait_fn):
             return "", otp_send_attempts
 
         if not hasattr(skymail_client, "_used_codes"):
             skymail_client._used_codes = set()
 
         tried_codes = set(getattr(skymail_client, "_used_codes", set()))
+        supports_filters = self._mailbox_wait_supports_filters(skymail_client)
         otp_deadline = time.time() + otp_wait_timeout
         otp_sent_at = float(otp_sent_at or time.time())
         next_resend_at = min(otp_deadline, otp_sent_at + otp_resend_wait_timeout)
@@ -796,17 +816,18 @@ class ChatGPTClient:
                 wait_time = min(wait_time, max(1, int(next_resend_at - now)))
 
             try:
-                code = skymail_client.wait_for_verification_code(
-                    email,
-                    timeout=wait_time,
-                    otp_sent_at=otp_sent_at,
-                    exclude_codes=tried_codes,
-                )
-            except TypeError:
-                code = skymail_client.wait_for_verification_code(
-                    email,
-                    timeout=wait_time,
-                )
+                if supports_filters:
+                    code = wait_fn(
+                        email,
+                        timeout=wait_time,
+                        otp_sent_at=otp_sent_at,
+                        exclude_codes=tried_codes,
+                    )
+                else:
+                    code = wait_fn(
+                        email,
+                        timeout=wait_time,
+                    )
             except Exception as e:
                 if "手动停止" in str(e):
                     raise

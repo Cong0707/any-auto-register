@@ -293,6 +293,40 @@ class ChatGPTClientRegistrationOtpResendTests(unittest.TestCase):
         self.assertEqual(wait_calls[0]["otp_sent_at"], 1000.0)
         self.assertGreater(wait_calls[1]["otp_sent_at"], wait_calls[0]["otp_sent_at"])
 
+    def test_wait_for_registration_email_otp_supports_legacy_mailbox_signature(self):
+        client = self._make_client()
+        state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+
+        class _LegacyMailbox:
+            _used_codes = set()
+
+            def __init__(self):
+                self.calls = []
+
+            def wait_for_verification_code(self, email, timeout=0):
+                self.calls.append((email, timeout))
+                return "112233"
+
+        mailbox = _LegacyMailbox()
+
+        code, attempts = client._wait_for_registration_email_otp(
+            "user@example.com",
+            state,
+            mailbox,
+            otp_wait_timeout=90,
+            otp_resend_wait_timeout=30,
+            otp_sent_at=1000.0,
+            otp_send_attempts=1,
+        )
+
+        self.assertEqual(code, "112233")
+        self.assertEqual(attempts, 1)
+        self.assertEqual(mailbox.calls, [("user@example.com", 30)])
+
 
 class OAuthClientPasswordlessTests(unittest.TestCase):
     def _make_client(self):
