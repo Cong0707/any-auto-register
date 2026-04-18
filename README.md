@@ -8,6 +8,12 @@
 
 > ⚠️ 免责声明：本项目仅供学习与研究使用，不得用于任何商业用途。使用本项目所产生的一切后果由使用者自行承担。
 
+<p align="center">
+  <a href="README.md">中文</a> |
+  <a href="README_en.md">English</a> |
+  <a href="README_vi.md">Tiếng Việt</a>
+</p>
+
 多平台账号自动注册与管理系统，支持插件化扩展、Web UI 管理、批量注册、状态同步，以及本地 Turnstile Solver 自动拉起。
 
 ## 目录
@@ -26,26 +32,15 @@
 - [常见问题排查](#常见问题排查)
 - [项目结构](#项目结构)
 - [Electron 开发说明](#electron-开发说明)
-- [License](#license)
 - [用户讨论群](#用户讨论群)
+- [赞助商目录](#赞助商目录)
 - [打赏博主](#赞助支持)
 - [Star History](#star-history)
+- [License](#license)
 
 ## 项目简介
 
-本仓库当前直接维护在 [Cong0707/any-auto-register](https://github.com/Cong0707/any-auto-register)。
-
-代码基线主要同步自 [zc-zhangchen/any-auto-register](https://github.com/zc-zhangchen/any-auto-register)，更早的历史来源追溯到 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git)。
-
-### 项目沿袭与改动来源
-
-- 基础框架、平台插件体系、Web UI 与任务调度能力，沿袭自 `lxf746/any-auto-register` 和后续的 `zc-zhangchen/any-auto-register` 历史演进。
-- Cloudflare Worker 临时邮箱接入思路，来源于 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)。
-- 当前分支上的 ChatGPT 注册链路修复，主要来自对 `dsclca12/auto_reg` 在 `2026-04-03` 的相关提交对比后手工缝合，而不是直接整体搬运。对应参考包括：
-- `1b94a1f`：提交前预热页面、补 Cloudflare Cookie、增加自然延迟、修正 headless 行为。
-- `663d39a`：验证码校验前的人类行为模拟，以及 `add_phone` / OTP 阶段的重试思路。
-- `6d64389`：`about_you` 页面访问补 Cookie、workspace 获取补链路、验证码等待时间调整。
-- 本仓库在此基础上另外加入了本地改动：`Browser -> VM` 的 Sentinel 重试顺序、`user_already_exists` 后切换验证码登录、上一枚 OTP 优先复用、consent HTML 中的 workspace 抽取日志与回退逻辑。
+本项目基于 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git) 二次开发
 
 ## 当前界面与实际平台展示
 
@@ -138,16 +133,14 @@
 
 | 服务名称 | 标识 | 说明 |
 | --- | --- | --- |
-| LuckMail | `luckmail` | 可免费领取 **125 个邮箱**用于测试，且**每天签到还能继续领取邮箱**；可通过 [https://mails.luckyous.com/9331211B](https://mails.luckyous.com/9331211B) 进入，支持博主获得少量赏金，用于维持开源测试 |
+| LuckMail | `luckmail` | 可免费领取用于测试，且**每天签到还能继续领取邮箱** |
 | MoeMail | `moemail` | 默认常用方案，自动注册账号并生成邮箱 |
 | TempMail.lol | `tempmail_lol` | 临时邮箱方案，部分地区可能需要代理 |
 | SkyMail (CloudMail) | `skymail` | 通过 API / Token / 域名使用 |
-| CloudMail (genToken) | `cloudmail` | 通过管理员邮箱/口令获取 token，直接轮询 `emailList` |
 | YYDS Mail / MaliAPI | `maliapi` | 支持域名与自动域名策略 |
 | GPTMail | `gptmail` | 基于 GPTMail API 生成临时邮箱并轮询邮件，支持已知域名时本地拼装随机地址 |
-| OpenTrashMail | `opentrashmail` | 对接自建 OpenTrashMail 服务，支持 `/api/random` 自动取号，也支持配置域名后本地拼装随机地址 |
 | DuckMail | `duckmail` | 临时邮箱方案 |
-| Freemail | `freemail` | 自建邮箱服务，支持指定域名生成 |
+| Freemail | `freemail` | 自建邮箱服务 |
 | Laoudo | `laoudo` | 固定邮箱方案 |
 | CF Worker | `cfworker` | Cloudflare Worker 自建邮箱 |
 
@@ -419,6 +412,9 @@ CAMOUFOX_VERSION=135.0.1 CAMOUFOX_RELEASE=beta.24 docker compose build app
 | grok2api | Grok token 管理、回填、聊天/API 服务 | `https://github.com/chenyme/grok2api.git` |
 | kiro-account-manager | Kiro 账号管理相关插件 | `https://github.com/hj01857655/kiro-account-manager.git` |
 
+插件页中的 **“安装最新版 / 更新到最新版”** 会同步仓库最新代码，且已支持 **卸载**（会先停止服务，再删除本地插件目录）。
+默认按 **最新 semver tag** 更新；你也可以在“设置 → 插件 → 安装/更新策略”切回 **分支 HEAD** 模式。
+
 如果你后续要改成 `ghproxy`、`gitclone`、企业 Git 镜像或其他代理地址，需要同步修改：
 
 ```text
@@ -531,13 +527,18 @@ Electron 开发模式不会自动启动 Python 后端。
 
 然后再运行 Electron。
 
-## License
-
-MIT License — 仅供学习研究，禁止商业使用。
-
 ## 用户讨论群
 
 - QQ群：**1065114376**（any-auto-register 注册机用户讨论群）
+
+## 赞助商目录
+
+感谢以下朋友与伙伴对 any-auto-register 的支持。
+
+| Logo | 名称 | 介绍 | 官网 |
+| --- | --- | --- | --- |
+| <a href="https://gzxsy.vip" target="_blank"><img src="frontend/public/gzxsylogo.jpg" alt="星思研中转站" width="140" /></a> | 星思研中转站 | 为 Claude Code、Codex 等模型调用场景提供稳定中转与配套服务，适合需要高可用接口、便捷接入和持续交付支持的开发者与团队。可前往官网了解最新方案。 | [https://gzxsy.vip](https://gzxsy.vip) |
+| <a href="https://ai.xiaoye.io/" target="_blank"><img src="frontend/public/xiaoyelogo.jpg" alt="小野API中转站" width="140" /></a> | 小野API中转站 | 为 Claude Code、Codex 等模型调用场景提供稳定中转与配套服务，适合需要高可用接口、便捷接入和持续交付支持的开发者与团队。可前往官网了解最新方案。 | [https://ai.xiaoye.io/](https://ai.xiaoye.io/) |
 
 ## 赞助支持
 
@@ -547,10 +548,14 @@ MIT License — 仅供学习研究，禁止商业使用。
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=Cong0707%2Fany-auto-register&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=zc-zhangchen%2Fany-auto-register&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Cong0707/any-auto-register&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Cong0707/any-auto-register&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Cong0707/any-auto-register&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=zc-zhangchen/any-auto-register&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=zc-zhangchen/any-auto-register&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=zc-zhangchen/any-auto-register&type=date&legend=top-left" />
  </picture>
 </a>
+
+## License
+
+MIT License — 仅供学习研究，禁止商业使用。

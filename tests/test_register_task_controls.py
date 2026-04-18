@@ -53,15 +53,45 @@ class _FakePlatform(BasePlatform):
         return True
 
 
-class RegisterTaskControlFlowTests(unittest.TestCase):
-    def _build_request(self):
-        return RegisterTaskRequest(
-            platform="fake",
-            count=1,
-            concurrency=1,
-            proxy="http://proxy.local:8080",
-            extra={"mail_provider": "fake"},
+class _FakeChatGPTWorkspacePlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+
+    _counter = 0
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    @classmethod
+    def reset_counter(cls):
+        cls._counter = 0
+
+    def register(self, email: str, password: str = None) -> Account:
+        type(self)._counter += 1
+        index = type(self)._counter
+        return Account(
+            platform="chatgpt",
+            email=f"user{index}@example.com",
+            password=password or "pw",
+            extra={"workspace_id": f"ws-{index}"},
         )
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
+class RegisterTaskControlFlowTests(unittest.TestCase):
+    def _build_request(self, **overrides):
+        payload = {
+            "platform": "fake",
+            "count": 1,
+            "concurrency": 1,
+            "proxy": "http://proxy.local:8080",
+            "extra": {"mail_provider": "fake"},
+        }
+        payload.update(overrides)
+        return RegisterTaskRequest(**payload)
 
     def _run_with_control(self, task_id: str, *, stop: bool = False, skip: bool = False):
         req = self._build_request()
@@ -96,6 +126,26 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 0)
         self.assertEqual(snapshot["skipped"], 0)
         self.assertEqual(snapshot["errors"], [])
+
+    def test_chatgpt_logs_workspace_progress_after_each_success(self):
+        task_id = "task-chatgpt-workspace-progress"
+        req = self._build_request(platform="chatgpt", count=2, concurrency=1)
+        _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTWorkspacePlatform.reset_counter()
+
+        with (
+            patch("core.registry.get", return_value=_FakeChatGPTWorkspacePlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        joined_logs = "\n".join(snapshot["logs"])
+
+        self.assertIn("workspace进度: 1/2", joined_logs)
+        self.assertIn("workspace进度: 2/2", joined_logs)
 
 
 if __name__ == "__main__":

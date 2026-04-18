@@ -49,11 +49,20 @@ class BasePlatform(ABC):
     def __init__(self, config: RegisterConfig = None):
         self.config = config or RegisterConfig()
         self._task_control = None
-        if self.config.executor_type not in self.supported_executors:
-            raise NotImplementedError(
-                f"{self.display_name} 暂不支持 '{self.config.executor_type}' 执行器，"
-                f"当前支持: {self.supported_executors}"
+        requested_executor = str(self.config.executor_type or "").strip() or "protocol"
+        if requested_executor not in self.supported_executors:
+            fallback = (
+                "protocol"
+                if "protocol" in self.supported_executors
+                else (self.supported_executors[0] if self.supported_executors else "protocol")
             )
+            print(
+                f"[{self.display_name or self.name}] 执行器 '{requested_executor}' 不受支持，"
+                f"自动切换为 '{fallback}' (支持: {self.supported_executors})"
+            )
+            self.config.executor_type = fallback
+        else:
+            self.config.executor_type = requested_executor
 
     @abstractmethod
     def register(self, email: str, password: str = None) -> Account:

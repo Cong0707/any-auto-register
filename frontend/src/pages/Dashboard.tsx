@@ -10,7 +10,7 @@ import {
 import { apiFetch } from '@/lib/utils'
 
 const PLATFORM_COLORS: Record<string, string> = {
-  trae: '#3b82f6',
+  chatgpt: '#3b82f6',
   cursor: '#10b981',
 }
 

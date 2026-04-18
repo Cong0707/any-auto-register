@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
 import shutil
 import subprocess
 import sys
@@ -64,6 +66,7 @@ _PROCS: dict[str, subprocess.Popen] = {}
 _LOG_FILES: dict[str, Any] = {}
 _LAST_ERROR: dict[str, str] = {}
 _LOCK = threading.Lock()
+_SEMVER_TAG_PATTERN = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 
 
 def _get_setting(key: str, default: str = "") -> str:
@@ -104,25 +107,280 @@ def _open_log(name: str):
     return f
 
 
-def _clone_repo_if_missing(name: str):
-    repo = _repo_path(name)
-    if repo.exists():
+def _make_tree_writable(path: Path):
+    if not path.exists():
         return
-    repo.parent.mkdir(parents=True, exist_ok=True)
+    for root, dirs, files in os.walk(path):
+        for dirname in dirs:
+            p = Path(root) / dirname
+            try:
+                p.chmod(p.stat().st_mode | stat.S_IWRITE)
+            except Exception:
+                pass
+        for filename in files:
+            p = Path(root) / filename
+            try:
+                p.chmod(p.stat().st_mode | stat.S_IWRITE)
+            except Exception:
+                pass
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IWRITE)
+    except Exception:
+        pass
+
+
+def _kill_processes_touching_path(path: Path):
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "$p=$args[0]; "
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { (($_.CommandLine -like ('*' + $p + '*')) -or ($_.ExecutablePath -like ('*' + $p + '*'))) } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+                str(path),
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+    except Exception:
+        pass
+
+
+def _external_apps_update_mode() -> str:
+    mode = _get_setting("external_apps_update_mode", "tag").strip().lower()
+    return "branch" if mode == "branch" else "tag"
+
+
+def _git_has_remote_branch(repo: Path, branch: str) -> bool:
+    if not branch:
+        return False
+    check = subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_creationflags(),
+    )
+    return check.returncode == 0
+
+
+def _origin_default_branch(repo: Path) -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(repo), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            text=True,
+            creationflags=_creationflags(),
+        ).strip()
+        if out.startswith("origin/"):
+            branch = out.split("/", 1)[1].strip()
+            if branch:
+                return branch
+    except Exception:
+        pass
+
+    for candidate in ("main", "master"):
+        if _git_has_remote_branch(repo, candidate):
+            return candidate
+    return "main"
+
+
+def _current_local_branch(repo: Path) -> str:
+    try:
+        branch = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True,
+            creationflags=_creationflags(),
+        ).strip()
+    except Exception:
+        return ""
+    return branch if branch and branch != "HEAD" else ""
+
+
+def _sync_repo_to_branch_head(repo: Path, preferred_branch: str = ""):
+    candidates = []
+    preferred = str(preferred_branch or "").strip()
+    if preferred:
+        candidates.append(preferred)
+    local_branch = _current_local_branch(repo)
+    if local_branch and local_branch not in candidates:
+        candidates.append(local_branch)
+    default_branch = _origin_default_branch(repo)
+    if default_branch and default_branch not in candidates:
+        candidates.append(default_branch)
+    for fallback in ("main", "master"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    for branch in candidates:
+        if not _git_has_remote_branch(repo, branch):
+            continue
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-B", branch, f"origin/{branch}"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "reset", "--hard", f"origin/{branch}"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "clean", "-fd"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+        return
+
+    raise RuntimeError(f"未找到可用远端分支（repo={repo}）")
+
+
+def _latest_semver_tag(repo: Path) -> str:
+    try:
+        out = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "for-each-ref",
+                "refs/tags",
+                "--sort=-version:refname",
+                "--format=%(refname:strip=2)",
+            ],
+            text=True,
+            creationflags=_creationflags(),
+        )
+    except Exception:
+        return ""
+
+    for line in out.splitlines():
+        tag = str(line or "").strip()
+        if not tag:
+            continue
+        if _SEMVER_TAG_PATTERN.fullmatch(tag):
+            return tag
+    return ""
+
+
+def _sync_repo_to_latest_semver_tag(repo: Path) -> bool:
+    tag = _latest_semver_tag(repo)
+    if not tag:
+        return False
     subprocess.run(
-        ["git", "clone", _REMOTE_URLS[name], str(repo)],
+        ["git", "-C", str(repo), "checkout", "--force", tag],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=_creationflags(),
     )
+    subprocess.run(
+        ["git", "-C", str(repo), "reset", "--hard", tag],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_creationflags(),
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "clean", "-fd"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_creationflags(),
+    )
+    return True
+
+
+def _sync_repo_to_latest(name: str):
+    repo = _repo_path(name)
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    if not repo.exists():
+        subprocess.run(
+            ["git", "clone", _REMOTE_URLS[name], str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+
+    subprocess.run(
+        ["git", "-C", str(repo), "fetch", "--all", "--tags", "--prune"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_creationflags(),
+    )
+    mode = _external_apps_update_mode()
+    if mode == "branch":
+        _sync_repo_to_branch_head(repo)
+        return
+
+    if not _sync_repo_to_latest_semver_tag(repo):
+        _sync_repo_to_branch_head(repo)
 
 
 def install(name: str) -> dict[str, Any]:
     with _LOCK:
         if name not in _SERVICE_META:
             raise KeyError(name)
-        _clone_repo_if_missing(name)
+        _sync_repo_to_latest(name)
+    return _status_one(name)
+
+
+def uninstall(name: str) -> dict[str, Any]:
+    if name not in _SERVICE_META:
+        raise KeyError(name)
+
+    try:
+        stop(name)
+    except Exception:
+        pass
+
+    with _LOCK:
+        repo = _repo_path(name)
+        if repo.exists():
+            _kill_processes_touching_path(repo)
+            last_exc: Exception | None = None
+            for _ in range(12):
+                try:
+                    _make_tree_writable(repo)
+                    shutil.rmtree(repo)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    _kill_processes_touching_path(repo)
+                    try:
+                        subprocess.run(
+                            ["attrib", "-R", str(repo / "*"), "/S", "/D"],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=_creationflags(),
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+            if repo.exists():
+                _LAST_ERROR[name] = (
+                    f"卸载失败：目录仍存在 {repo}"
+                    + (f"，原因：{last_exc}" if last_exc else "")
+                )
+                raise RuntimeError(_LAST_ERROR[name])
+        _PROCS.pop(name, None)
+        _LAST_ERROR.pop(name, None)
+        _close_log(name)
+
     return _status_one(name)
 
 

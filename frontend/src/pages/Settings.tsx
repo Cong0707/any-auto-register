@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert } from 'antd'
 import {
   SaveOutlined,
@@ -14,13 +14,18 @@ import {
   LockOutlined,
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
+import MailImportPanel from '@/components/settings/MailImportPanel'
 import { apiFetch } from '@/lib/utils'
+
+function resolveEffectiveMailProvider(mailProvider: string, mailImportSource: string) {
+  if (mailProvider !== 'mail_import') return mailProvider
+  return mailImportSource === 'applemail' ? 'applemail' : 'microsoft'
+}
 
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
-    { label: 'Outlook（本地导入）', value: 'outlook' },
-    { label: 'AppleMail（小苹果 / 本地邮箱池）', value: 'applemail' },
+    { label: '邮箱导入', value: 'mail_import' },
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
@@ -48,6 +53,16 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '本地 Solver (Camoufox)', value: 'local_solver' },
     { label: '手动', value: 'manual' },
   ],
+  outlook_backend: [
+    { label: 'Graph（默认）', value: 'graph' },
+    { label: 'IMAP', value: 'imap' },
+  ],
+  luckmail_email_type: [
+    { label: '自动 / 留空', value: '' },
+    { label: '微软邮箱 - Graph', value: 'ms_graph' },
+    { label: '微软邮箱 - IMAP', value: 'ms_imap' },
+    { label: '自建邮箱', value: 'self_built' },
+  ],
   cpa_cleanup_enabled: [
     { label: '关闭', value: '0' },
     { label: '开启', value: '1' },
@@ -55,6 +70,10 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   codex_proxy_upload_type: [
     { label: 'AT（Access Token，推荐）', value: 'at' },
     { label: 'RT（Refresh Token）', value: 'rt' },
+  ],
+  external_apps_update_mode: [
+    { label: 'latest semver tag（推荐）', value: 'tag' },
+    { label: '分支 HEAD', value: 'branch' },
   ],
 }
 
@@ -144,7 +163,14 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: 'AppleMail / 小苹果',
+        title: '邮箱导入（微软 / Outlook / Hotmail）',
+        desc: '使用本地导入的微软账号池，运行时支持 Graph / IMAP 轮询（默认 Graph）',
+        fields: [
+          { key: 'outlook_backend', label: '微软收信方式', type: 'select' },
+        ],
+      },
+      {
+        title: '邮箱导入（AppleMail / 小苹果）',
         desc: '读取本地邮箱池文件，通过 refresh_token + client_id 调用小苹果取件接口；支持在本页直接导入 JSON',
         fields: [
           { key: 'applemail_base_url', label: 'API URL', placeholder: 'https://www.appleemail.top' },
@@ -195,7 +221,10 @@ const TAB_ITEMS = [
           { key: 'cfworker_admin_token', label: '管理员 Token', secret: true },
           { key: 'cfworker_custom_auth', label: '站点密码', secret: true },
           { key: 'cfworker_subdomain', label: '固定子域名', placeholder: 'mail / pool-a' },
+          { key: 'email_domain_rule_enabled', label: '启用域名规则', type: 'boolean' },
+          { key: 'email_domain_level_count', label: '域名级数（N 级）', placeholder: '例如 2 / 3 / 4' },
           { key: 'cfworker_random_subdomain', label: '随机子域名', type: 'boolean' },
+          { key: 'cfworker_random_name_subdomain', label: '随机姓名子域名', type: 'boolean' },
           { key: 'cfworker_fingerprint', label: 'Fingerprint', placeholder: '6703363b...' },
         ],
       },
@@ -205,7 +234,7 @@ const TAB_ITEMS = [
         fields: [
           { key: 'luckmail_base_url', label: '平台地址', placeholder: 'https://mails.luckyous.com' },
           { key: 'luckmail_api_key', label: 'API Key', secret: true },
-          { key: 'luckmail_email_type', label: '邮箱类型（可选）', placeholder: 'ms_graph / ms_imap / self_built' },
+          { key: 'luckmail_email_type', label: '邮箱类型（可选）', type: 'select' },
           { key: 'luckmail_domain', label: '邮箱域名（可选）', placeholder: 'outlook.com / gmail.com' },
         ],
       },
@@ -235,6 +264,7 @@ const TAB_ITEMS = [
         title: 'CPA 面板',
         desc: '注册完成后自动上传到 CPA 管理平台',
         fields: [
+          { key: 'cpa_enabled', label: '启用自动上传', type: 'boolean' },
           { key: 'cpa_api_url', label: 'API URL', placeholder: 'https://your-cpa.example.com' },
           { key: 'cpa_api_key', label: 'API Key', secret: true },
         ],
@@ -243,6 +273,7 @@ const TAB_ITEMS = [
         title: 'Sub2API 面板',
         desc: '注册完成后自动上传到 Sub2API 管理后台',
         fields: [
+          { key: 'sub2api_enabled', label: '启用自动上传', type: 'boolean' },
           { key: 'sub2api_api_url', label: 'API URL', placeholder: 'https://your-sub2api.example.com' },
           { key: 'sub2api_api_key', label: 'API Key', secret: true },
           { key: 'sub2api_group_ids', label: '分组 ID', placeholder: '多个分组用英文逗号分隔，例如 2,4,8' },
@@ -386,18 +417,51 @@ interface TabConfig {
   sections: SectionConfig[]
 }
 
-interface AppleMailPoolPreviewItem {
-  index: number
-  email: string
-  mailbox: string
+const MAILBOX_SECTION_FIELD_KEY_BY_PROVIDER: Record<string, string> = {
+  laoudo: 'laoudo_email',
+  freemail: 'freemail_api_url',
+  moemail: 'moemail_api_url',
+  skymail: 'skymail_api_base',
+  cloudmail: 'cloudmail_api_base',
+  maliapi: 'maliapi_base_url',
+  microsoft: 'outlook_backend',
+  applemail: 'applemail_base_url',
+  gptmail: 'gptmail_base_url',
+  opentrashmail: 'opentrashmail_api_url',
+  duckmail: 'duckmail_api_url',
+  cfworker: 'cfworker_api_url',
+  luckmail: 'luckmail_base_url',
 }
 
-interface AppleMailPoolSnapshot {
-  filename: string
-  pool_dir: string
-  count: number
-  items: AppleMailPoolPreviewItem[]
-  truncated: boolean
+const MAILBOX_SECTION_INDEX_BY_PROVIDER: Record<string, number> = {
+  tempmail_lol: 10,
+}
+
+function splitMailboxSections(sections: SectionConfig[], mailProvider: string) {
+  const defaultSection = sections[0] || null
+  let selectedSection: SectionConfig | null = null
+
+  const byIndex = MAILBOX_SECTION_INDEX_BY_PROVIDER[mailProvider]
+  if (Number.isInteger(byIndex)) {
+    selectedSection = sections[byIndex] || null
+  } else {
+    const fieldKey = MAILBOX_SECTION_FIELD_KEY_BY_PROVIDER[mailProvider]
+    if (fieldKey) {
+      selectedSection = sections.find((section) => section.fields.some((field) => field.key === fieldKey)) || null
+    }
+  }
+
+  if (selectedSection === defaultSection) {
+    selectedSection = null
+  }
+
+  const remainingSections = sections.filter((section) => section !== defaultSection && section !== selectedSection)
+
+  return {
+    defaultSection,
+    selectedSection,
+    remainingSections,
+  }
 }
 
 function formatResultText(data: unknown) {
@@ -442,6 +506,12 @@ function parseStoredDomainList(value: unknown): string[] {
       .flatMap((line) => line.split(','))
       .map((item) => item.trim()),
   )
+}
+
+function resolveFeatureEnabledConfig(value: unknown, fallbackEnabled: boolean): boolean {
+  const normalized = String(value ?? '').trim()
+  if (!normalized) return fallbackEnabled
+  return parseBooleanConfigValue(normalized)
 }
 
 const CONTRIBUTION_REDEEM_OPTIONS = [10, 100, 1000]
@@ -501,7 +571,11 @@ function ConfigField({ field }: { field: FieldConfig }) {
   const isBooleanField = field.type === 'boolean'
   const helpText =
     field.key === 'default_executor'
-      ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily、Trae 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
+      ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
+      : field.key === 'email_domain_rule_enabled'
+      ? '仅 CF Worker 生效：开启后会校验域名级数，以及域名至少包含 2 个字母和 2 个数字。'
+      : field.key === 'email_domain_level_count'
+      ? '例如 2=example.com，3=a.example.com，4=a.b.example.com。'
       : undefined
 
   return (
@@ -568,22 +642,24 @@ function CFWorkerDomainPoolSection({ form }: { form: any }) {
       <Form.List name="cfworker_domains">
         {(fields, { add, remove }) => (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            {fields.map((field) => (
-              <Space key={field.key} align="start" style={{ display: 'flex' }}>
-                <Form.Item
-                  {...field}
-                  label={field.name === 0 ? '全部域名' : ''}
-                  style={{ flex: 1, marginBottom: 0 }}
-                  rules={[
-                    {
-                      validator: async (_, value) => {
-                        if (!String(value || '').trim()) {
-                          throw new Error('请输入域名')
-                        }
+            {fields.map((field) => {
+              const { key, ...restField } = field
+              return (
+                <Space key={key} align="start" style={{ display: 'flex' }}>
+                  <Form.Item
+                    {...restField}
+                    label={field.name === 0 ? '全部域名' : ''}
+                    style={{ flex: 1, marginBottom: 0 }}
+                    rules={[
+                      {
+                        validator: async (_, value) => {
+                          if (!String(value || '').trim()) {
+                            throw new Error('请输入域名')
+                          }
+                        },
                       },
-                    },
-                  ]}
-                >
+                    ]}
+                  >
                   <Input placeholder="example.com" />
                 </Form.Item>
                 <Button
@@ -605,7 +681,7 @@ function CFWorkerDomainPoolSection({ form }: { form: any }) {
                   删除
                 </Button>
               </Space>
-            ))}
+            )})}
             {fields.length === 0 ? (
               <Typography.Text type="secondary">还没有配置域名。添加后即可在下方选择启用项。</Typography.Text>
             ) : null}
@@ -664,159 +740,6 @@ function CFWorkerDomainPoolSection({ form }: { form: any }) {
       <Typography.Text type="secondary" style={{ display: 'block', marginTop: 12 }}>
         仅已启用域名会参与注册；点击已启用标签可直接移除。
       </Typography.Text>
-    </Card>
-  )
-}
-
-function AppleMailPoolImportSection({ form }: { form: any }) {
-  const [content, setContent] = useState('')
-  const [filename, setFilename] = useState('')
-  const [importing, setImporting] = useState(false)
-  const [snapshot, setSnapshot] = useState<AppleMailPoolSnapshot | null>(null)
-  const [loadingSnapshot, setLoadingSnapshot] = useState(false)
-  const watchedPoolDir = Form.useWatch('applemail_pool_dir', form) || 'mail'
-  const watchedPoolFile = Form.useWatch('applemail_pool_file', form) || ''
-
-  const loadSnapshot = async () => {
-    setLoadingSnapshot(true)
-    try {
-      const params = new URLSearchParams()
-      if (String(watchedPoolDir || '').trim()) {
-        params.set('pool_dir', String(watchedPoolDir || '').trim())
-      }
-      if (String(watchedPoolFile || '').trim()) {
-        params.set('pool_file', String(watchedPoolFile || '').trim())
-      }
-      const result = await apiFetch(`/config/applemail/pool?${params.toString()}`)
-      setSnapshot(result)
-    } catch {
-      setSnapshot(null)
-    } finally {
-      setLoadingSnapshot(false)
-    }
-  }
-
-  useEffect(() => {
-    void loadSnapshot()
-  }, [watchedPoolDir, watchedPoolFile])
-
-  const handleImport = async () => {
-    if (!content.trim()) {
-      message.error('请输入 JSON 或 TXT 内容')
-      return
-    }
-
-    setImporting(true)
-    try {
-      const poolDir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
-      const result = await apiFetch('/config/applemail/import', {
-        method: 'POST',
-        body: JSON.stringify({
-          content,
-          filename,
-          pool_dir: poolDir,
-          bind_to_config: true,
-        }),
-      })
-
-      form.setFieldsValue({
-        mail_provider: 'applemail',
-        applemail_pool_dir: result.pool_dir,
-        applemail_pool_file: result.filename,
-      })
-      setSnapshot({
-        filename: result.filename,
-        pool_dir: result.pool_dir,
-        count: result.count,
-        items: result.items || [],
-        truncated: Boolean(result.truncated),
-      })
-      setContent('')
-      setFilename('')
-      message.success(`导入成功，共 ${result.count} 个邮箱，已绑定 ${result.filename}`)
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'AppleMail 内容导入失败'
-      message.error(errorMessage || 'AppleMail 内容导入失败')
-    } finally {
-      setImporting(false)
-    }
-  }
-
-  return (
-    <Card
-      title="AppleMail 内容导入"
-      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>支持 JSON 或 TXT；导入后自动绑定当前邮箱池文件</span>}
-      style={{ marginBottom: 16 }}
-    >
-      <Space direction="vertical" style={{ width: '100%' }} size={12}>
-        <Typography.Text type="secondary">
-          支持数组/对象 JSON，也支持 `mail/*.txt` 那种每行一条的 `email----password----client_id----refresh_token` 格式。常见字段别名如 `clientId` / `refreshToken` / `folder` 会自动规范化。
-        </Typography.Text>
-        <Input
-          value={filename}
-          onChange={(event) => setFilename(event.target.value)}
-          placeholder="可选文件名，例如 applemail_hotmail.json；留空自动生成"
-        />
-        <Input.TextArea
-          value={content}
-          onChange={(event) => setContent(event.target.value)}
-          rows={10}
-          placeholder={'[\n  {\n    "email": "demo@example.com",\n    "clientId": "xxxx",\n    "refreshToken": "xxxx",\n    "folder": "INBOX"\n  }\n]\n\n或粘贴 TXT:\ndemo@example.com----password----client_id----refresh_token'}
-          style={{ fontFamily: 'monospace' }}
-        />
-        <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Button
-            danger
-            onClick={() => {
-              setContent('')
-              setFilename('')
-            }}
-          >
-            清空
-          </Button>
-          <Space>
-            <Button onClick={() => void loadSnapshot()} loading={loadingSnapshot}>
-              刷新预览
-            </Button>
-            <Button type="primary" onClick={handleImport} loading={importing}>
-              确认导入
-            </Button>
-          </Space>
-        </Space>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <Tag color="blue">已导入: {snapshot?.count || 0} 个邮箱</Tag>
-          {snapshot?.filename ? <Typography.Text type="secondary">当前文件: {snapshot.filename}</Typography.Text> : null}
-        </div>
-
-        <div
-          style={{
-            border: '1px solid rgba(127,127,127,0.25)',
-            borderRadius: 8,
-            padding: 12,
-            background: 'rgba(127,127,127,0.06)',
-            minHeight: 88,
-            maxHeight: 260,
-            overflowY: 'auto',
-            fontFamily: 'monospace',
-            fontSize: 13,
-            lineHeight: 1.7,
-          }}
-        >
-          {snapshot?.items?.length ? (
-            snapshot.items.map((item) => (
-              <div key={`${item.index}-${item.email}`}>
-                {item.index}. {item.email}
-              </div>
-            ))
-          ) : (
-            <Typography.Text type="secondary">当前还没有可预览的邮箱池内容。</Typography.Text>
-          )}
-        </div>
-        {snapshot?.truncated ? (
-          <Typography.Text type="secondary">预览只展示前 100 个邮箱，完整内容以文件为准。</Typography.Text>
-        ) : null}
-      </Space>
     </Card>
   )
 }
@@ -880,6 +803,8 @@ function IntegrationsPanel() {
   const [items, setItems] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState('')
+  const [updateMode, setUpdateMode] = useState<'tag' | 'branch'>('tag')
+  const saved = false
   const [resultModal, setResultModal] = useState({
     open: false,
     title: '',
@@ -899,8 +824,13 @@ function IntegrationsPanel() {
   const load = async () => {
     setLoading(true)
     try {
-      const d = await apiFetch('/integrations/services')
+      const [d, cfg] = await Promise.all([
+        apiFetch('/integrations/services'),
+        apiFetch('/config'),
+      ])
       setItems(d.items || [])
+      const mode = String(cfg?.external_apps_update_mode || 'tag').trim().toLowerCase()
+      setUpdateMode(mode === 'branch' ? 'branch' : 'tag')
     } finally {
       setLoading(false)
     }
@@ -945,13 +875,61 @@ function IntegrationsPanel() {
     }
   }
 
+  const updateInstallMode = async (nextMode: 'tag' | 'branch') => {
+    setBusy('update-mode')
+    try {
+      await apiFetch('/config', {
+        method: 'PUT',
+        body: JSON.stringify({ data: { external_apps_update_mode: nextMode } }),
+      })
+      setUpdateMode(nextMode)
+      message.success(nextMode === 'tag' ? '已切换到 tag 模式' : '已切换到分支模式')
+    } catch (e: any) {
+      message.error(e?.message || '切换失败')
+    } finally {
+      setBusy('')
+    }
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {false ? (
+        <div
+          style={{
+            position: 'fixed',
+            left: '50%',
+            bottom: 24,
+            transform: 'translateX(-50%)',
+            zIndex: 1000,
+            width: 'min(720px, calc(100vw - 32px))',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              width: '100%',
+              padding: 0,
+              borderRadius: 0,
+              border: 'none',
+              background: 'transparent',
+              boxShadow: 'none',
+              backdropFilter: 'none',
+              pointerEvents: 'auto',
+            }}
+          >
+            <Button type="primary" icon={<SaveOutlined />} onClick={() => {}} loading={false} block size="large">
+              {saved ? '已保存 ✓' : '保存配置'}
+            </Button>
+          </div>
+        </div>
+      ) : null}
       <Modal
         open={resultModal.open}
         title={resultModal.title}
         onCancel={() => setResultModal((v) => ({ ...v, open: false }))}
         onOk={() => setResultModal((v) => ({ ...v, open: false }))}
+        okText="确定"
+        cancelText="取消"
         width={760}
       >
         <Typography.Paragraph style={{ marginBottom: 8, color: resultModal.ok ? '#10b981' : '#ef4444' }}>
@@ -974,6 +952,24 @@ function IntegrationsPanel() {
           {resultModal.content}
         </pre>
       </Modal>
+
+      <Card title="安装/更新策略">
+        <Space wrap align="center">
+          <Select
+            style={{ width: 320 }}
+            value={updateMode}
+            options={SELECT_FIELDS.external_apps_update_mode}
+            onChange={(value) => setUpdateMode(value as 'tag' | 'branch')}
+          />
+          <Button
+            type="primary"
+            loading={busy === 'update-mode'}
+            onClick={() => updateInstallMode(updateMode)}
+          >
+            保存策略
+          </Button>
+        </Space>
+      </Card>
 
       <Card title="批量操作">
         <Space wrap>
@@ -1020,9 +1016,16 @@ function IntegrationsPanel() {
                   loading={busy === `install-${item.name}`}
                   onClick={() => doAction(`install-${item.name}`, apiFetch(`/integrations/services/${item.name}/install`, { method: 'POST' }))}
                 >
-                  安装
+                  安装最新版
                 </Button>
-              ) : null}
+              ) : (
+                <Button
+                  loading={busy === `install-${item.name}`}
+                  onClick={() => doAction(`install-${item.name}`, apiFetch(`/integrations/services/${item.name}/install`, { method: 'POST' }))}
+                >
+                  更新到最新版
+                </Button>
+              )}
               <Button
                 loading={busy === `start-${item.name}`}
                 disabled={!item.repo_exists}
@@ -1035,6 +1038,21 @@ function IntegrationsPanel() {
                 onClick={() => doAction(`stop-${item.name}`, apiFetch(`/integrations/services/${item.name}/stop`, { method: 'POST' }))}
               >
                 停止
+              </Button>
+              <Button
+                danger
+                loading={busy === `uninstall-${item.name}`}
+                disabled={!item.repo_exists}
+                onClick={() => {
+                  const ok = window.confirm(`确认卸载 ${item.label}？\n会停止服务并删除本地插件目录。`)
+                  if (!ok) return
+                  doAction(
+                    `uninstall-${item.name}`,
+                    apiFetch(`/integrations/services/${item.name}/uninstall`, { method: 'POST' }),
+                  )
+                }}
+              >
+                卸载
               </Button>
               {item.name === 'grok2api' ? (
                 <Button
@@ -1078,10 +1096,20 @@ function ContributionPanel({
   const [statsResponse, setStatsResponse] = useState<Record<string, unknown> | null>(null)
   const [redeemResponse, setRedeemResponse] = useState<Record<string, unknown> | null>(null)
   const [statsError, setStatsError] = useState('')
+  const [bindingCustom, setBindingCustom] = useState(false)
+  const [customEmail, setCustomEmail] = useState('')
+  const [customStatsResponse, setCustomStatsResponse] = useState<Record<string, unknown> | null>(null)
+  const [customBalanceResponse, setCustomBalanceResponse] = useState<Record<string, unknown> | null>(null)
+  const [loadingCustomStats, setLoadingCustomStats] = useState(false)
 
   const contributionEnabled = Form.useWatch('contribution_enabled', form)
+  const contributionMode = String(Form.useWatch('contribution_mode', form) || 'codex').trim()
   const contributionServerUrl = String(Form.useWatch('contribution_server_url', form) || '').trim()
   const contributionKey = String(Form.useWatch('contribution_key', form) || '').trim()
+  const customContributionUrl = String(Form.useWatch('custom_contribution_url', form) || '').trim()
+  const customContributionToken = String(Form.useWatch('custom_contribution_token', form) || '').trim()
+
+  const isCustomMode = contributionMode === 'custom'
 
   const rawData = asRecord(statsResponse?.['data'])
   const serverInfo = pickRecord(rawData, ['server_info', 'server', 'server_stats', 'stats']) || rawData
@@ -1225,6 +1253,68 @@ function ContributionPanel({
     }
   }
 
+  const doBindCustom = async () => {
+    if (!customEmail.trim()) {
+      message.error('请输入邮箱')
+      return
+    }
+    if (!customContributionUrl) {
+      message.error('请先填写自定义服务器地址')
+      return
+    }
+    setBindingCustom(true)
+    try {
+      const data = await apiFetch('/contribution/custom/bind', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: customEmail.trim(),
+          server_url: customContributionUrl,
+        }),
+      })
+      const token = pickString(asRecord(data), ['token'])
+      if (token) {
+        form.setFieldValue('custom_contribution_token', token)
+        message.success('绑定成功！token 已自动填充，请点击保存配置')
+        setCustomEmail('')
+      } else {
+        message.success('绑定成功')
+      }
+    } catch (e: any) {
+      message.error(String(e?.message || '绑定失败'))
+    } finally {
+      setBindingCustom(false)
+    }
+  }
+
+  const fetchCustomStats = async () => {
+    if (!contributionEnabled) {
+      message.warning('请先开启贡献功能')
+      return
+    }
+    if (!customContributionUrl) {
+      message.error('请先填写自定义服务器地址')
+      return
+    }
+    if (!customContributionToken) {
+      message.error('请先绑定邮箱获取 token')
+      return
+    }
+    setLoadingCustomStats(true)
+    try {
+      const [status, balance] = await Promise.all([
+        apiFetch(`/contribution/custom/status?server_url=${encodeURIComponent(customContributionUrl)}&token=${encodeURIComponent(customContributionToken)}`),
+        apiFetch(`/contribution/custom/balance?server_url=${encodeURIComponent(customContributionUrl)}&token=${encodeURIComponent(customContributionToken)}`),
+      ])
+      setCustomStatsResponse(asRecord(status))
+      setCustomBalanceResponse(asRecord(balance))
+      message.success('信息已刷新')
+    } catch (e: any) {
+      message.error(String(e?.message || '获取信息失败'))
+    } finally {
+      setLoadingCustomStats(false)
+    }
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <Card title="配置">
@@ -1245,173 +1335,179 @@ function ContributionPanel({
         <Form.Item name="contribution_enabled" label="是否开启" valuePropName="checked">
           <Switch checkedChildren="开启" unCheckedChildren="关闭" />
         </Form.Item>
-        <Form.Item
-          name="contribution_server_url"
-          label="服务器地址"
-          rules={[{ required: true, message: '请输入服务器地址' }]}
-        >
-          <Input placeholder="http://new.xem8k5.top:7317/" />
+        <Form.Item name="contribution_mode" label="贡献模式">
+          <Select>
+            <Select.Option value="codex">Codex2API（xem中转站）</Select.Option>
+            <Select.Option value="custom">自定义贡献系统</Select.Option>
+          </Select>
         </Form.Item>
-        <Form.Item name="contribution_key" label="API Key">
-          <Input
-            placeholder="留空可点击右侧按钮自动创建"
-            addonAfter={(
-              <Button
-                type="link"
-                size="small"
-                loading={creatingKey}
-                onClick={() => { void doGenerateKey() }}
-                style={{ paddingInline: 0 }}
-              >
-                没有key?请求新建
-              </Button>
-            )}
-          />
-        </Form.Item>
+
+        {!isCustomMode ? (
+          <>
+            <Form.Item
+              name="contribution_server_url"
+              label="服务器地址"
+              rules={[{ required: true, message: '请输入服务器地址' }]}
+            >
+              <Input placeholder="http://new.xem8k5.top:7317/" />
+            </Form.Item>
+            <Form.Item name="contribution_key" label="API Key">
+              <Input
+                placeholder="留空可点击右侧按钮自动创建"
+                addonAfter={(
+                  <Button
+                    type="link"
+                    size="small"
+                    loading={creatingKey}
+                    onClick={() => { void doGenerateKey() }}
+                    style={{ paddingInline: 0 }}
+                  >
+                    没有key?请求新建
+                  </Button>
+                )}
+              />
+            </Form.Item>
+          </>
+        ) : (
+          <>
+            <Form.Item
+              name="custom_contribution_url"
+              label="自定义服务器地址"
+              rules={[{ required: true, message: '请输入服务器地址' }]}
+            >
+              <Input placeholder="http://127.0.0.1:5000" />
+            </Form.Item>
+            <Form.Item label="绑定邮箱">
+              <Space.Compact style={{ width: '100%' }}>
+                <Input
+                  placeholder="输入邮箱以绑定账号"
+                  value={customEmail}
+                  onChange={(e) => setCustomEmail(e.target.value)}
+                  onPressEnter={() => { void doBindCustom() }}
+                />
+                <Button type="primary" loading={bindingCustom} onClick={() => { void doBindCustom() }}>
+                  绑定
+                </Button>
+              </Space.Compact>
+            </Form.Item>
+            <Form.Item name="custom_contribution_token" label="Token">
+              <Input.TextArea placeholder="绑定邮箱后自动填充" rows={3} />
+            </Form.Item>
+          </>
+        )}
+
         <Button type="primary" icon={<SaveOutlined />} onClick={onSave} loading={saving} block>
           {saved ? '已保存 ✓' : '保存配置'}
         </Button>
       </Card>
 
-      <Card
-        title="信息"
-        extra={(
-          <Button loading={loadingStats} onClick={() => { void fetchStats() }}>
-            刷新信息
-          </Button>
-        )}
-      >
-        {!contributionEnabled ? (
-          <Alert type="info" showIcon message="贡献功能已关闭，开启后可获取服务器与 key 信息。" />
-        ) : (
-          <Space direction="vertical" style={{ width: '100%' }} size={12}>
-            {statsError ? <Alert type="error" showIcon message={statsError} /> : null}
-            <div>
-              <Typography.Text strong>服务器信息</Typography.Text>
-              <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
-                <Tag color="blue">账号数: {formatDisplayNumber(serverQuotaAccountCount)}</Tag>
-                <Tag color="geekblue">总额度: {formatDisplayNumber(serverQuotaTotal)}</Tag>
-                <Tag color="volcano">已用额度: {formatDisplayNumber(serverQuotaUsed)}</Tag>
-                <Tag color="green">剩余额度: {formatDisplayNumber(serverQuotaRemaining)}</Tag>
-                <Tag color="orange">已用占比: {formatDisplayPercent(serverQuotaUsedPercent)}</Tag>
-                <Tag color="cyan">剩余占比: {formatDisplayPercent(serverQuotaRemainingPercent)}</Tag>
-                <Tag color="purple">折算账号数: {formatDisplayNumber(serverQuotaRemainingAccounts, 2)}</Tag>
-              </div>
-            </div>
-            <div>
-              <Typography.Text strong>API Key</Typography.Text>
-              <Space style={{ marginLeft: 8 }}>
-                <Typography.Text copyable={keyFromStats ? { text: keyFromStats } : undefined}>
-                  {keyFromStats || '-'}
-                </Typography.Text>
+      {!isCustomMode ? (
+        <>
+          <Card
+            title="信息"
+            extra={(
+              <Button loading={loadingStats} onClick={() => { void fetchStats() }}>
+                刷新信息
+              </Button>
+            )}
+          >
+            {!contributionEnabled ? (
+              <Alert type="info" showIcon message="贡献功能已关闭，开启后可获取服务器与 key 信息。" />
+            ) : (
+              <Space direction="vertical" style={{ width: '100%' }} size={12}>
+                {statsError ? <Alert type="error" showIcon message={statsError} /> : null}
+                <div>
+                  <Typography.Text strong>服务器信息</Typography.Text>
+                  <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
+                    <Tag color="blue">账号数: {formatDisplayNumber(serverQuotaAccountCount)}</Tag>
+                    <Tag color="geekblue">总额度: {formatDisplayNumber(serverQuotaTotal)}</Tag>
+                    <Tag color="volcano">已用额度: {formatDisplayNumber(serverQuotaUsed)}</Tag>
+                    <Tag color="green">剩余额度: {formatDisplayNumber(serverQuotaRemaining)}</Tag>
+                    <Tag color="orange">已用占比: {formatDisplayPercent(serverQuotaUsedPercent)}</Tag>
+                    <Tag color="cyan">剩余占比: {formatDisplayPercent(serverQuotaRemainingPercent)}</Tag>
+                    <Tag color="purple">折算账号数: {formatDisplayNumber(serverQuotaRemainingAccounts, 2)}</Tag>
+                  </div>
+                </div>
+                <div>
+                  <Typography.Text strong>API Key</Typography.Text>
+                  <Space style={{ marginLeft: 8 }}>
+                    <Typography.Text copyable={keyFromStats ? { text: keyFromStats } : undefined}>
+                      {keyFromStats || '-'}
+                    </Typography.Text>
+                  </Space>
+                </div>
+                <div>
+                  <Typography.Text strong>key 信息</Typography.Text>
+                  <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
+                    <Tag color="blue">余额: {keyBalance ?? '-'}</Tag>
+                    <Tag color="geekblue">来源: {keySource}</Tag>
+                    <Tag color="cyan">绑定账号数: {boundAccounts ?? '-'}</Tag>
+                    <Tag color="purple">结算金额: {settlementAmount ?? '-'}</Tag>
+                  </div>
+                </div>
               </Space>
-            </div>
-            <div>
-              <Typography.Text strong>key 信息</Typography.Text>
-              <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
-                <Tag color="blue">余额: {keyBalance ?? '-'}</Tag>
-                <Tag color="geekblue">来源: {keySource}</Tag>
-                <Tag color="cyan">绑定账号数: {boundAccounts ?? '-'}</Tag>
-                <Tag color="purple">结算金额: {settlementAmount ?? '-'}</Tag>
-              </div>
-            </div>
-          </Space>
-        )}
-      </Card>
+            )}
+          </Card>
 
-      <Card title="提现">
-        <Space direction="vertical" style={{ width: '100%' }}>
-          <Typography.Text>key 当前额度：{keyBalance ?? '-'}</Typography.Text>
-          <Form.Item label="提现金额" style={{ marginBottom: 0 }}>
-            <Select
-              value={redeemAmount}
-              onChange={setRedeemAmount}
-              style={{ width: 240 }}
-              options={CONTRIBUTION_REDEEM_OPTIONS.map((amount) => ({ label: String(amount), value: amount }))}
-            />
-          </Form.Item>
-          <Button type="primary" danger onClick={() => { void doRedeem() }} loading={redeeming}>
-            提现确认
-          </Button>
-          {redeemResponse ? (
-            <Alert
-              type={redeemResponse.ok === false ? 'error' : 'success'}
-              showIcon
-              message={redeemResponse.ok === false ? `提现失败：${String(redeemResponse.error || '-')}` : redeemSuccessText}
-              description={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{formatResultText(redeemResponse)}</pre>}
-            />
-          ) : null}
-        </Space>
-      </Card>
-    </div>
-  )
-}
-
-function OutlookImportSection() {
-  const { message: msg } = App.useApp()
-  const [value, setValue] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState<any | null>(null)
-
-  const handleSubmit = async () => {
-    const payload = String(value || '').trim()
-    if (!payload) {
-      msg.error('请输入 Outlook 账号内容')
-      return
-    }
-    setLoading(true)
-    try {
-      const res = await apiFetch('/outlook/batch-import', {
-        method: 'POST',
-        body: JSON.stringify({ data: payload, enabled: true }),
-      })
-      setResult(res)
-      msg.success(`导入完成：成功 ${res.success} / 失败 ${res.failed}`)
-    } catch (e: any) {
-      msg.error(e?.message || '导入失败')
-      setResult({ error: e?.message || String(e) })
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <Card
-      title="Outlook 批量导入"
-      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>每行格式：邮箱----密码 或 邮箱----密码----client_id----refresh_token</span>}
-      style={{ marginBottom: 16 }}
-    >
-      <Input.TextArea
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        placeholder={`example@outlook.com----password\nexample@outlook.com----password----client_id----refresh_token`}
-        autoSize={{ minRows: 6, maxRows: 14 }}
-      />
-      <Space style={{ marginTop: 12 }}>
-        <Button type="primary" loading={loading} onClick={handleSubmit}>
-          导入
-        </Button>
-        <Button onClick={() => { setValue(''); setResult(null) }}>
-          清空
-        </Button>
-      </Space>
-      {result ? (
-        <div style={{ marginTop: 12 }}>
-          {'success' in result ? (
-            <Alert
-              type={result.failed ? 'warning' : 'success'}
-              showIcon
-              message={`导入完成：成功 ${result.success} / 失败 ${result.failed}`}
-              description={result.errors && result.errors.length ? (
-                <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{result.errors.join('\n')}</pre>
-              ) : undefined}
-            />
-          ) : (
-            <Alert type="error" showIcon message="导入失败" description={String(result.error || '')} />
+          <Card title="提现">
+            <Space direction="vertical" style={{ width: '100%' }}>
+              <Typography.Text>key 当前额度：{keyBalance ?? '-'}</Typography.Text>
+              <Form.Item label="提现金额" style={{ marginBottom: 0 }}>
+                <Select
+                  value={redeemAmount}
+                  onChange={setRedeemAmount}
+                  style={{ width: 240 }}
+                  options={CONTRIBUTION_REDEEM_OPTIONS.map((amount) => ({ label: String(amount), value: amount }))}
+                />
+              </Form.Item>
+              <Button type="primary" danger onClick={() => { void doRedeem() }} loading={redeeming}>
+                提现确认
+              </Button>
+              {redeemResponse ? (
+                <Alert
+                  type={redeemResponse.ok === false ? 'error' : 'success'}
+                  showIcon
+                  message={redeemResponse.ok === false ? `提现失败：${String(redeemResponse.error || '-')}` : redeemSuccessText}
+                  description={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{formatResultText(redeemResponse)}</pre>}
+                />
+              ) : null}
+            </Space>
+          </Card>
+        </>
+      ) : (
+        <Card
+          title="信息"
+          extra={(
+            <Button loading={loadingCustomStats} onClick={() => { void fetchCustomStats() }}>
+              刷新信息
+            </Button>
           )}
-        </div>
-      ) : null}
-    </Card>
+        >
+          {!contributionEnabled ? (
+            <Alert type="info" showIcon message="贡献功能已关闭，开启后可获取信息。" />
+          ) : !customContributionToken ? (
+            <Alert type="warning" showIcon message="请先绑定邮箱获取 token" />
+          ) : (
+            <Space direction="vertical" style={{ width: '100%' }} size={12}>
+              <div>
+                <Typography.Text strong>余额信息</Typography.Text>
+                <div style={{ marginTop: 8 }}>
+                  <Tag color="blue">余额: {pickNumber(asRecord(customBalanceResponse), ['balance']) ?? '-'}</Tag>
+                </div>
+              </div>
+              <div>
+                <Typography.Text strong>贡献记录</Typography.Text>
+                <div style={{ marginTop: 8 }}>
+                  <Tag color="green">成功: {pickNumber(asRecord(customStatsResponse), ['success_count']) ?? '-'}</Tag>
+                  <Tag color="orange">待处理: {pickNumber(asRecord(customStatsResponse), ['pending_count']) ?? '-'}</Tag>
+                  <Tag color="red">失败: {pickNumber(asRecord(customStatsResponse), ['failed_count']) ?? '-'}</Tag>
+                </div>
+              </div>
+            </Space>
+          )}
+        </Card>
+      )}
+    </div>
   )
 }
 
@@ -1664,9 +1760,17 @@ export default function Settings() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
+  const currentMailProviderRaw = String(Form.useWatch('mail_provider', form) || '')
+  const currentMailImportSource = String(Form.useWatch('mail_import_source', form) || 'microsoft')
+  const currentMailProvider = resolveEffectiveMailProvider(currentMailProviderRaw, currentMailImportSource)
+  const showFloatingSaveButton = activeTab === 'mailbox' || activeTab === 'chatgpt'
+  const contentPaneRef = useRef<HTMLDivElement | null>(null)
+  const [floatingSaveBounds, setFloatingSaveBounds] = useState<{ left: number; width: number } | null>(null)
 
   useEffect(() => {
     apiFetch('/config').then((data) => {
+      const configMailProvider = String(data.mail_provider || 'luckmail')
+      const isMailImportProvider = configMailProvider === 'microsoft' || configMailProvider === 'outlook' || configMailProvider === 'applemail'
       if (!data.mail_provider) {
         data.mail_provider = 'luckmail'
       }
@@ -1679,6 +1783,9 @@ export default function Settings() {
       if (!data.applemail_mailboxes) {
         data.applemail_mailboxes = 'INBOX,Junk'
       }
+      if (!data.outlook_backend) {
+        data.outlook_backend = 'graph'
+      }
       if (!data.gptmail_base_url) {
         data.gptmail_base_url = 'https://mail.chatgpt.org.uk'
       }
@@ -1688,24 +1795,83 @@ export default function Settings() {
       if (!data.luckmail_base_url) {
         data.luckmail_base_url = 'https://mails.luckyous.com/'
       }
+      if (!String(data.contribution_enabled ?? '').trim()) {
+        data.contribution_enabled = false
+      }
       if (!data.contribution_server_url) {
         data.contribution_server_url = 'http://new.xem8k5.top:7317/'
+      }
+      if (!data.contribution_mode) {
+        data.contribution_mode = 'codex'
+      }
+      if (!data.custom_contribution_url) {
+        data.custom_contribution_url = 'http://127.0.0.1:5000'
       }
       if (!data.cloudmail_timeout) {
         data.cloudmail_timeout = 30
       }
+      data.cpa_enabled = resolveFeatureEnabledConfig(
+        data.cpa_enabled,
+        Boolean(String(data.cpa_api_url ?? '').trim()),
+      )
+      data.sub2api_enabled = resolveFeatureEnabledConfig(
+        data.sub2api_enabled,
+        Boolean(String(data.sub2api_api_url ?? '').trim() && String(data.sub2api_api_key ?? '').trim()),
+      )
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
+      data.cfworker_random_name_subdomain = parseBooleanConfigValue(data.cfworker_random_name_subdomain)
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
+      data.email_domain_rule_enabled = parseBooleanConfigValue(data.email_domain_rule_enabled)
+      if (!String(data.email_domain_level_count ?? '').trim()) {
+        data.email_domain_level_count = 2
+      }
+      data.mail_import_source = configMailProvider === 'applemail' ? 'applemail' : 'microsoft'
+      data.mail_provider = isMailImportProvider ? 'mail_import' : configMailProvider
       form.setFieldsValue(data)
     })
   }, [form])
+
+  useEffect(() => {
+    if (!showFloatingSaveButton) {
+      setFloatingSaveBounds(null)
+      return
+    }
+
+    const element = contentPaneRef.current
+    if (!element) return
+
+    const updateBounds = () => {
+      const rect = element.getBoundingClientRect()
+      setFloatingSaveBounds({
+        left: rect.left,
+        width: rect.width,
+      })
+    }
+
+    updateBounds()
+
+    const observer =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => updateBounds())
+        : null
+
+    observer?.observe(element)
+    window.addEventListener('resize', updateBounds)
+
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', updateBounds)
+    }
+  }, [showFloatingSaveButton, activeTab])
 
   const save = async () => {
     setSaving(true)
     try {
       const values = form.getFieldsValue(true)
+      values.mail_provider = resolveEffectiveMailProvider(values.mail_provider, values.mail_import_source)
+      delete values.mail_import_source
       const domains = normalizeDomainList(values.cfworker_domains)
       const enabledDomains = normalizeDomainList(values.cfworker_enabled_domains).filter((domain) => domains.includes(domain))
 
@@ -1720,16 +1886,42 @@ export default function Settings() {
       if (domains.length > 0) {
         values.cfworker_domain = ''
       }
+      values.cpa_enabled = parseBooleanConfigValue(values.cpa_enabled)
+      values.sub2api_enabled = parseBooleanConfigValue(values.sub2api_enabled)
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
+      values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
+      values.email_domain_rule_enabled = parseBooleanConfigValue(values.email_domain_rule_enabled)
+      const rawDomainLevelCount = Number.parseInt(String(values.email_domain_level_count ?? '').trim(), 10)
+      if (values.mail_provider === 'cfworker' && values.email_domain_rule_enabled) {
+        if (!Number.isInteger(rawDomainLevelCount) || rawDomainLevelCount < 2) {
+          setActiveTab('mailbox')
+          message.error('域名级数必须是大于等于 2 的整数')
+          return
+        }
+      }
+      values.email_domain_level_count =
+        Number.isInteger(rawDomainLevelCount) && rawDomainLevelCount >= 2
+          ? String(rawDomainLevelCount)
+          : '2'
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
       form.setFieldsValue({
+        mail_provider: values.mail_provider === 'microsoft' || values.mail_provider === 'applemail' ? 'mail_import' : values.mail_provider,
+        mail_import_source: values.mail_provider === 'applemail' ? 'applemail' : 'microsoft',
+        cpa_enabled: values.cpa_enabled,
+        sub2api_enabled: values.sub2api_enabled,
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
         cfworker_random_subdomain: values.cfworker_random_subdomain,
+        cfworker_random_name_subdomain: values.cfworker_random_name_subdomain,
         contribution_enabled: values.contribution_enabled,
+        contribution_mode: values.contribution_mode,
+        custom_contribution_url: values.custom_contribution_url,
+        custom_contribution_token: values.custom_contribution_token,
+        email_domain_rule_enabled: values.email_domain_rule_enabled,
+        email_domain_level_count: values.email_domain_level_count,
       })
       message.success('保存成功')
       setSaved(true)
@@ -1740,9 +1932,47 @@ export default function Settings() {
   }
 
   const currentTab = TAB_ITEMS.find((t) => t.key === activeTab) as TabConfig
+  const mailboxSections =
+    activeTab === 'mailbox'
+      ? splitMailboxSections(currentTab.sections, currentMailProvider)
+      : { defaultSection: null, selectedSection: null, remainingSections: currentTab.sections }
+  const floatingSaveWidth = floatingSaveBounds ? Math.max(floatingSaveBounds.width, 0) : 0
+  const floatingSaveLeft =
+    floatingSaveBounds && floatingSaveWidth > 0
+      ? floatingSaveBounds.left + (floatingSaveBounds.width - floatingSaveWidth) / 2
+      : 0
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16, paddingBottom: showFloatingSaveButton ? 96 : 0 }}>
+      {showFloatingSaveButton && floatingSaveBounds && floatingSaveWidth > 0 ? (
+        <div
+          style={{
+            position: 'fixed',
+            left: floatingSaveLeft,
+            bottom: 24,
+            zIndex: 1000,
+            width: floatingSaveWidth,
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              width: '100%',
+              padding: 0,
+              borderRadius: 0,
+              border: 'none',
+              background: 'transparent',
+              boxShadow: 'none',
+              backdropFilter: 'none',
+              pointerEvents: 'auto',
+            }}
+          >
+            <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
+              {saved ? '已保存 ✓' : '保存配置'}
+            </Button>
+          </div>
+        </div>
+      ) : null}
       <div>
         <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>全局配置</h1>
         <p style={{ color: '#7a8ba3', marginTop: 4 }}>配置将持久化保存，注册任务自动使用</p>
@@ -1766,7 +1996,7 @@ export default function Settings() {
           />
         </div>
 
-        <div style={{ flex: 1 }}>
+        <div ref={contentPaneRef} style={{ flex: 1 }}>
           {activeTab === 'integrations' ? (
             <IntegrationsPanel />
           ) : activeTab === 'security' ? (
@@ -1778,15 +2008,32 @@ export default function Settings() {
               ) : (
                 <>
                   {activeTab === 'captcha' ? <SolverStatus /> : null}
-                  {currentTab.sections.map((section) => (
-                    <ConfigSection key={section.title} section={section} />
-                  ))}
-                  {activeTab === 'mailbox' ? <AppleMailPoolImportSection form={form} /> : null}
-                  {activeTab === 'mailbox' ? <CFWorkerDomainPoolSection form={form} /> : null}
-                  {activeTab === 'mailbox' ? <OutlookImportSection /> : null}
-                  <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
+                  {activeTab === 'mailbox' ? (
+                    <>
+                      {mailboxSections.defaultSection ? (
+                        <ConfigSection key={mailboxSections.defaultSection.title} section={mailboxSections.defaultSection} />
+                      ) : null}
+                      {mailboxSections.selectedSection ? (
+                        <ConfigSection key={`${mailboxSections.selectedSection.title}-selected`} section={mailboxSections.selectedSection} />
+                      ) : null}
+                      <MailImportPanel form={form} />
+                      {currentMailProviderRaw === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
+                      {mailboxSections.remainingSections.map((section) => (
+                        <ConfigSection key={section.title} section={section} />
+                      ))}
+                      {currentMailProviderRaw !== 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
+                    </>
+                  ) : (
+                    currentTab.sections.map((section) => (
+                      <ConfigSection key={section.title} section={section} />
+                    ))
+                  )}
+                  {showFloatingSaveButton ? <div style={{ height: 8 }} /> : null}
+                  {!showFloatingSaveButton ? (
+                    <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
                     {saved ? '已保存 ✓' : '保存配置'}
-                  </Button>
+                    </Button>
+                  ) : null}
                 </>
               )}
             </Form>

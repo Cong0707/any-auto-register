@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Button, message, Space } from 'antd'
+import { Button, message, Space, Tag } from 'antd'
 import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
@@ -11,8 +11,36 @@ interface TaskLogPanelProps {
 
 type TaskTerminalStatus = 'idle' | 'done' | 'failed' | 'stopped'
 
+interface RegisterSummary {
+  success: number
+  registered: number
+  total: number
+}
+
+function parseCounter(value: unknown): number {
+  const n = Number(value || 0)
+  if (!Number.isFinite(n) || n < 0) return 0
+  return Math.floor(n)
+}
+
+function normalizeSummary(next: RegisterSummary): RegisterSummary {
+  const success = parseCounter(next.success)
+  const registered = Math.max(parseCounter(next.registered), success)
+  const total = Math.max(parseCounter(next.total), registered)
+  return { success, registered, total }
+}
+
+function mergeSummary(previous: RegisterSummary, incoming: Partial<RegisterSummary>): RegisterSummary {
+  return normalizeSummary({
+    success: incoming.success ?? previous.success,
+    registered: incoming.registered ?? previous.registered,
+    total: incoming.total ?? previous.total,
+  })
+}
+
 export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const [lines, setLines] = useState<string[]>([])
+  const [summary, setSummary] = useState<RegisterSummary>({ success: 0, registered: 0, total: 0 })
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
   const [skipLoading, setSkipLoading] = useState(false)
@@ -81,6 +109,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     const maxRetryMs = 8000
     nextSinceRef.current = 0
     setLines([])
+    setSummary({ success: 0, registered: 0, total: 0 })
     setError('')
     setTerminalStatus('idle')
     setStopRequested(false)
@@ -93,12 +122,22 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         const snapshot = await apiFetch(`/tasks/${taskId}`) as {
           logs?: string[]
           status?: TaskTerminalStatus | string
+          success?: number
+          registered?: number
+          total?: number
           control?: { stop_requested?: boolean }
         }
         if (cancelled) return true
 
         const snapshotLines = Array.isArray(snapshot.logs) ? snapshot.logs : []
         setLines(snapshotLines)
+        setSummary((previous) =>
+          mergeSummary(previous, {
+            success: snapshot.success,
+            registered: snapshot.registered,
+            total: snapshot.total,
+          }),
+        )
         nextSinceRef.current = snapshotLines.length
         setStopRequested(Boolean(snapshot.control?.stop_requested))
 
@@ -159,7 +198,17 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
                 line?: string
                 done?: boolean
                 status?: TaskTerminalStatus
+                success?: number
+                registered?: number
+                total?: number
               }
+              setSummary((previous) =>
+                mergeSummary(previous, {
+                  success: payload.success,
+                  registered: payload.registered,
+                  total: payload.total,
+                }),
+              )
               if (payload.line) {
                 nextSinceRef.current += 1
                 setLines((previous) => [...previous, payload.line!])
@@ -224,6 +273,12 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <Space wrap style={{ marginBottom: 8 }}>
+        <Tag color="green">注册成功：{summary.success}</Tag>
+        <Tag color="blue">已注册：{summary.registered}</Tag>
+        <Tag color="default">总共注册：{summary.total}</Tag>
+      </Space>
+
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <Space>
           <Button

@@ -17,8 +17,8 @@ from api.config import router as config_router
 from api.actions import router as actions_router
 from api.integrations import router as integrations_router
 from api.auth import router as auth_router
+from api.mail_imports import router as mail_imports_router
 from api.outlook import router as outlook_router
-from api.chatgpt import router as chatgpt_router
 from api.contribution import router as contribution_router
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "any-auto-register")
@@ -111,8 +111,8 @@ app.include_router(config_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")
 app.include_router(integrations_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
+app.include_router(mail_imports_router, prefix="/api")
 app.include_router(outlook_router, prefix="/api")
-app.include_router(chatgpt_router, prefix="/api")
 app.include_router(contribution_router, prefix="/api")
 
 

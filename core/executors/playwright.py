@@ -52,6 +52,16 @@ class PlaywrightExecutor(BaseExecutor):
             raise RuntimeError("Playwright context 未初始化")
         return self._context
 
+    @property
+    def page(self) -> Any:
+        """兼容平台插件直接访问 executor.page 的用法。"""
+        return self._require_page()
+
+    @property
+    def context(self) -> Any:
+        """兼容平台插件直接访问 executor.context 的用法。"""
+        return self._require_context()
+
     def get(self, url, *, headers=None, params=None) -> Response:
         import urllib.parse
 

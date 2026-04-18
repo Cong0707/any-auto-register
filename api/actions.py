@@ -26,6 +26,14 @@ class BatchActionRequest(BaseModel):
     params: dict = {}
 
 
+def _get_platform_cls_or_404(platform: str):
+    try:
+        return get(platform)
+    except KeyError as exc:
+        detail = exc.args[0] if exc.args else str(exc)
+        raise HTTPException(404, detail) from exc
+
+
 def _merge_extra_patch(base: dict, patch: dict) -> dict:
     for key, value in patch.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -75,11 +83,22 @@ def _apply_action_result(
         from datetime import datetime, timezone
         acc_model.updated_at = datetime.now(timezone.utc)
         session.add(acc_model)
-    if platform == "chatgpt" and action_id == "upload_cpa":
+    if action_id == "upload_cpa":
         from services.chatgpt_sync import update_account_model_cpa_sync
 
         sync_msg = result.get("data") or result.get("error") or ""
         update_account_model_cpa_sync(
+            acc_model,
+            bool(result.get("ok")),
+            str(sync_msg),
+            session=session,
+            commit=False,
+        )
+    if platform == "chatgpt" and action_id == "upload_sub2api":
+        from services.chatgpt_sync import update_account_model_sub2api_sync
+
+        sync_msg = result.get("data") or result.get("error") or ""
+        update_account_model_sub2api_sync(
             acc_model,
             bool(result.get("ok")),
             str(sync_msg),
@@ -228,7 +247,7 @@ def _execute_batch_cliproxy_sync(accounts: list[AccountModel], session: Session)
 @router.get("/{platform}")
 def list_actions(platform: str):
     """获取平台支持的操作列表"""
-    PlatformCls = get(platform)
+    PlatformCls = _get_platform_cls_or_404(platform)
     instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
     return {"actions": instance.get_platform_actions()}
 
@@ -240,7 +259,7 @@ def execute_batch_action(
     body: BatchActionRequest,
     session: Session = Depends(get_session),
 ):
-    PlatformCls = get(platform)
+    PlatformCls = _get_platform_cls_or_404(platform)
     instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
     accounts, missing_ids = _resolve_batch_accounts(platform, body, session)
 
@@ -332,7 +351,7 @@ def execute_action(
     if not acc_model or acc_model.platform != platform:
         raise HTTPException(404, "账号不存在")
 
-    PlatformCls = get(platform)
+    PlatformCls = _get_platform_cls_or_404(platform)
     instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
 
     try:

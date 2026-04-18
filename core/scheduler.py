@@ -21,8 +21,12 @@ class Scheduler:
         if self._running:
             return
         self._running = True
-        self._last_trial_check_at = 0.0
-        self._last_cpa_maintenance_at = 0.0
+        
+        now = time.time()
+        # 将上次执行时间设为当前时间，避免应用一启动就瞬间触发定时任务（如 CPA 自动注册）
+        self._last_trial_check_at = now
+        self._last_cpa_maintenance_at = now
+
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         print("[Scheduler] 已启动")

@@ -41,6 +41,8 @@ def list_accounts(
     platform: Optional[str] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
+    created_at_start: Optional[datetime] = None,
+    created_at_end: Optional[datetime] = None,
     page: int = 1,
     page_size: int = 20,
     session: Session = Depends(get_session),
@@ -52,6 +54,10 @@ def list_accounts(
         q = q.where(AccountModel.status == status)
     if email:
         q = q.where(AccountModel.email.contains(email))
+    if created_at_start:
+        q = q.where(AccountModel.created_at >= created_at_start)
+    if created_at_end:
+        q = q.where(AccountModel.created_at <= created_at_end)
     total = len(session.exec(q).all())
     items = session.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
     return {"total": total, "page": page, "items": items}

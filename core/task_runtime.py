@@ -137,6 +137,7 @@ class RegisterTaskRecord:
     progress: str = "0/0"
     logs: list[str] = field(default_factory=list)
     success: int = 0
+    registered: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
     cashier_urls: list[str] = field(default_factory=list)
@@ -155,12 +156,16 @@ class RegisterTaskRecord:
             "platform": self.platform,
             "source": self.source,
             "meta": dict(self.meta),
+            "total": self.total,
             "progress": self.progress,
             "logs": list(self.logs),
             "success": self.success,
+            "registered": self.registered,
             "skipped": self.skipped,
             "errors": list(self.errors),
             "control": self.control.snapshot(),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
         if self.cashier_urls:
             data["cashier_urls"] = list(self.cashier_urls)
@@ -265,12 +270,28 @@ class RegisterTaskStore:
             record.cashier_urls.append(cashier_url)
             record.updated_at = time.time()
 
+    def update_counters(
+        self,
+        task_id: str,
+        *,
+        success: int | None = None,
+        registered: int | None = None,
+    ) -> None:
+        with self._lock:
+            record = self._records[task_id]
+            if success is not None:
+                record.success = max(0, int(success))
+            if registered is not None:
+                record.registered = max(0, int(registered))
+            record.updated_at = time.time()
+
     def finish(
         self,
         task_id: str,
         *,
         status: str,
         success: int,
+        registered: int | None = None,
         skipped: int,
         errors: list[str],
         error: str = "",
@@ -279,6 +300,10 @@ class RegisterTaskStore:
             record = self._records[task_id]
             record.status = status
             record.success = success
+            if registered is None:
+                record.registered = max(success + skipped + len(errors), 0)
+            else:
+                record.registered = max(0, int(registered))
             record.skipped = skipped
             record.errors = list(errors)
             record.error = error

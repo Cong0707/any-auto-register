@@ -8,7 +8,7 @@ from sqlmodel import Session, select
 
 from core.base_platform import Account, AccountStatus
 from core.db import AccountModel, engine
-from services.external_apps import install, list_status, start, start_all, stop, stop_all
+from services.external_apps import install, list_status, start, start_all, stop, stop_all, uninstall
 from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, get_cliproxy_sync_state
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -58,6 +58,11 @@ def start_service(name: str):
 @router.post("/services/{name}/install")
 def install_service(name: str):
     return install(name)
+
+
+@router.post("/services/{name}/uninstall")
+def uninstall_service(name: str):
+    return uninstall(name)
 
 
 @router.post("/services/{name}/stop")

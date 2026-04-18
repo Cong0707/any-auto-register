@@ -1,17 +1,9 @@
-from datetime import datetime, timezone
-from typing import List, Dict, Any
-
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from sqlmodel import Session, select
+from typing import Any, Dict, List
+from services.mail_imports import MailImportExecuteRequest, mail_import_registry
 
-from core.db import engine, OutlookAccountModel
-
-router = APIRouter(prefix="/outlook", tags=["outlook"])
-
-
-def _utcnow():
-    return datetime.now(timezone.utc)
+router = APIRouter(prefix="/outlook", tags=["微软邮箱（Outlook / Hotmail）"])
 
 
 class OutlookBatchImportRequest(BaseModel):
@@ -30,82 +22,32 @@ class OutlookBatchImportResponse(BaseModel):
 @router.post("/batch-import", response_model=OutlookBatchImportResponse)
 def batch_import_outlook(request: OutlookBatchImportRequest):
     """
-    批量导入 Outlook 邮箱账户
+    批量导入微软邮箱（Outlook / Hotmail）账户
 
     支持两种格式（每行一个账户，字段用 ---- 分隔）：
-    - 邮箱----密码
-    - 邮箱----密码----client_id----refresh_token
+    - 邮箱----密码----client_id----refresh_token（微软 OAuth）
+    - 邮箱----mailapi_url（MailAPI URL 轮询取码）
+
+    运行时默认优先使用 Graph 后端读取邮件；MailAPI URL 账号会走 URL 轮询取码。
     """
-    lines = (request.data or "").splitlines()
-    total = len(lines)
-    success = 0
-    failed = 0
-    accounts: List[Dict[str, Any]] = []
-    errors: List[str] = []
-
-    with Session(engine) as session:
-        for idx, raw_line in enumerate(lines):
-            line = str(raw_line or "").strip()
-            if not line or line.startswith("#"):
-                continue
-
-            parts = [part.strip() for part in line.split("----")]
-            if len(parts) < 2:
-                failed += 1
-                errors.append(f"行 {idx + 1}: 格式错误，至少需要邮箱和密码")
-                continue
-
-            email = parts[0]
-            password = parts[1]
-            if "@" not in email:
-                failed += 1
-                errors.append(f"行 {idx + 1}: 无效的邮箱地址: {email}")
-                continue
-
-            existing = session.exec(
-                select(OutlookAccountModel).where(OutlookAccountModel.email == email)
-            ).first()
-            if existing:
-                failed += 1
-                errors.append(f"行 {idx + 1}: 邮箱已存在: {email}")
-                continue
-
-            client_id = parts[2] if len(parts) >= 3 else ""
-            refresh_token = parts[3] if len(parts) >= 4 else ""
-
-            try:
-                account = OutlookAccountModel(
-                    email=email,
-                    password=password,
-                    client_id=client_id,
-                    refresh_token=refresh_token,
-                    enabled=bool(request.enabled),
-                    created_at=_utcnow(),
-                    updated_at=_utcnow(),
-                )
-                session.add(account)
-                session.commit()
-                session.refresh(account)
-
-                accounts.append(
-                    {
-                        "id": account.id,
-                        "email": account.email,
-                        "has_oauth": bool(account.client_id and account.refresh_token),
-                        "enabled": account.enabled,
-                    }
-                )
-                success += 1
-            except Exception as e:
-                session.rollback()
-                failed += 1
-                errors.append(f"行 {idx + 1}: 创建失败: {str(e)}")
-
-    return OutlookBatchImportResponse(
-        total=total,
-        success=success,
-        failed=failed,
-        accounts=accounts,
-        errors=errors,
-    )
+    try:
+        strategy = mail_import_registry.get("microsoft")
+        result = strategy.execute(
+            MailImportExecuteRequest(
+                type="microsoft",
+                content=request.data,
+                enabled=request.enabled,
+            )
+        )
+        return OutlookBatchImportResponse(
+            total=result.summary.total,
+            success=result.summary.success,
+            failed=result.summary.failed,
+            accounts=list(result.meta.get("accounts") or []),
+            errors=result.errors,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
